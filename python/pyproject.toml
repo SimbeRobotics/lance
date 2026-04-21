@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dynamic = ["version"]
+version = "6.0.0b2+simbe.1"
 dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.6.1"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]

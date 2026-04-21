@@ -94,6 +94,7 @@ wheelhouse
 
 # Rust
 target
+target-manylinux
 **/sccache.log
 
 # c++ lsp

@@ -7,11 +7,16 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import uuid
+from pathlib import Path
 
 import lance
+import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.file import LanceFileSession
+from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
 
@@ -26,6 +31,76 @@ def _blob_row_addresses(dataset):
         .column("_rowaddr")
         .to_pylist()
     )
+
+
+def _commit_blob_fragments(dataset_uri, schema, fragments, initial_bases=None):
+    operation = lance.LanceOperation.Overwrite(
+        schema,
+        fragments,
+        initial_bases=initial_bases,
+    )
+    return lance.LanceDataset.commit(dataset_uri, operation)
+
+
+def _external_blob_table(blob_path, payload=b"hello"):
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(payload)
+    return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
+
+
+def _blob_sidecar_path(data_dir, data_file_key, blob_id):
+    sidecar_name = f"{int(f'{blob_id:032b}'[::-1], 2):032b}.blob"
+    return data_dir / data_file_key / sidecar_name
+
+
+def _add_columns_blob_v2_values(tmp_path):
+    external_base = tmp_path / "external_base"
+    external_blob = external_base / "external_blob.bin"
+    external_blob.parent.mkdir(parents=True, exist_ok=True)
+    external_blob.write_bytes(b"external")
+
+    payloads = [
+        b"inline",
+        b"p" * (64 * 1024 + 1024),
+        b"d" * (4 * 1024 * 1024 + 1024),
+        b"external",
+    ]
+    values = [payloads[0], payloads[1], payloads[2], external_blob.as_uri()]
+    initial_bases = [DatasetBasePath(external_base.as_uri(), name="external", id=1)]
+    return values, payloads, initial_bases
+
+
+def _assert_blob_v2_add_columns_result(dataset, column, payloads):
+    desc = dataset.to_table(columns=[column]).column(column).chunk(0)
+
+    assert desc.field("kind").to_pylist() == [0, 1, 2, 3]
+    assert desc.field("blob_id").to_pylist()[3] == 1
+    assert desc.field("blob_uri").to_pylist()[3] == "external_blob.bin"
+
+    blobs = dataset.take_blobs(column, indices=range(len(payloads)))
+    assert [blob.readall() for blob in blobs] == payloads
+
+
+def _dataset_file_set(dataset_path):
+    return {
+        path.relative_to(dataset_path)
+        for path in dataset_path.rglob("*")
+        if path.is_file()
+    }
+
+
+def _write_two_fragment_blob_v2_seed_dataset(tmp_path, name):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    dataset_path = tmp_path / name
+    ds = lance.write_dataset(
+        pa.table({"id": range(8)}),
+        dataset_path,
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+        max_rows_per_file=4,
+        max_rows_per_group=4,
+    )
+    return ds, dataset_path, values, payloads
 
 
 def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
@@ -102,6 +177,40 @@ def test_scan_blob_as_binary(tmp_path):
 
     tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
     assert tbl.column("blobs").to_pylist() == values
+
+
+def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
+    values = [b"abc", b"defgh", b"ijklmnop"]
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+    )
+    schema = pa.schema([pa.field("id", pa.int32()), blob_field])
+    table = pa.table(
+        {"id": [0, 1, 2], "blob": values},
+        schema=schema,
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds", data_storage_version="2.0")
+
+    for blob_handling in [None, "all_descriptions", "blobs_descriptions"]:
+        kwargs = {} if blob_handling is None else {"blob_handling": blob_handling}
+        descriptions = ds.scanner(columns=["blob"], **kwargs).to_table().column("blob")
+        chunk = descriptions.chunk(0)
+        assert chunk.type == pa.struct(
+            [
+                pa.field("position", pa.uint64()),
+                pa.field("size", pa.uint64()),
+            ]
+        )
+        assert chunk.field("size").to_pylist() == [3, 5, 8]
+
+    tbl = ds.scanner(columns=["blob"], blob_handling="all_binary").to_table()
+    assert tbl.column("blob").to_pylist() == values
+    assert [blob.read() for blob in ds.take_blobs("blob", indices=[0, 1, 2])] == values
+    assert ds.read_blobs("blob", indices=[0, 1, 2]) == [
+        (0, b"abc"),
+        (1, b"defgh"),
+        (2, b"ijklmnop"),
+    ]
 
 
 def test_fragment_scan_blob_as_binary(tmp_path):
@@ -516,6 +625,232 @@ def test_blob_extension_write_inline(tmp_path):
         assert f.read() == b"foo"
 
 
+def test_blob_field_threshold_metadata():
+    field = lance.blob_field(
+        "blob",
+        inline_size_threshold=16 * 1024,
+        dedicated_size_threshold=2 * 1024 * 1024,
+        pack_file_size_threshold=512 * 1024 * 1024,
+    )
+
+    assert field.metadata[b"lance-encoding:blob-inline-size-threshold"] == b"16384"
+    assert field.metadata[b"lance-encoding:blob-dedicated-size-threshold"] == b"2097152"
+    assert (
+        field.metadata[b"lance-encoding:blob-pack-file-size-threshold"] == b"536870912"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        pytest.param(
+            {"inline_size_threshold": -1},
+            ValueError,
+            "inline_size_threshold must be non-negative",
+            id="negative_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": 0},
+            ValueError,
+            "dedicated_size_threshold must be positive",
+            id="zero_dedicated",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": -1},
+            ValueError,
+            "dedicated_size_threshold must be positive",
+            id="negative_dedicated",
+        ),
+        pytest.param(
+            {"inline_size_threshold": True},
+            TypeError,
+            "inline_size_threshold must be an int",
+            id="bool_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": True},
+            TypeError,
+            "dedicated_size_threshold must be an int",
+            id="bool_dedicated",
+        ),
+        pytest.param(
+            {"inline_size_threshold": 1.5},
+            TypeError,
+            "inline_size_threshold must be an int",
+            id="float_inline",
+        ),
+        pytest.param(
+            {"inline_size_threshold": 2**100},
+            OverflowError,
+            "inline_size_threshold must fit in a Rust usize",
+            id="overflow_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": 2**100},
+            OverflowError,
+            "dedicated_size_threshold must fit in a Rust usize",
+            id="overflow_dedicated",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 0},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="zero_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": -1},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="negative_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": True},
+            TypeError,
+            "pack_file_size_threshold must be an int",
+            id="bool_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 2**100},
+            OverflowError,
+            "pack_file_size_threshold must fit in a Rust usize",
+            id="overflow_pack_file",
+        ),
+    ],
+)
+def test_blob_field_rejects_invalid_thresholds(kwargs, error, message):
+    with pytest.raises(error, match=message):
+        lance.blob_field("blob", **kwargs)
+
+
+def test_blob_extension_inline_threshold_per_column(tmp_path):
+    payload = b"x" * 2048
+    schema = pa.schema(
+        [
+            lance.blob_field("inline_blob", inline_size_threshold=4096),
+            lance.blob_field("packed_blob", inline_size_threshold=1024),
+        ]
+    )
+    table = pa.table(
+        {
+            "inline_blob": lance.blob_array([payload]),
+            "packed_blob": lance.blob_array([payload]),
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_inline_threshold_per_column",
+        data_storage_version="2.2",
+    )
+
+    desc = ds.to_table(columns=["inline_blob", "packed_blob"])
+    assert desc.column("inline_blob").chunk(0).field("kind").to_pylist() == [0]
+    assert desc.column("packed_blob").chunk(0).field("kind").to_pylist() == [1]
+
+
+def test_blob_extension_threshold_metadata_persists_after_reopen(tmp_path):
+    dataset_path = tmp_path / "test_ds_v2_threshold_metadata_persists"
+    schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-inline-size-threshold"
+        ]
+        == b"1024"
+    )
+
+
+def test_blob_extension_append_rejects_explicit_threshold_mismatch(tmp_path):
+    dataset_path = tmp_path / "test_ds_v2_append_threshold_mismatch"
+    initial_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=4096)])
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_pack_file_threshold_metadata_persists_after_reopen(
+    tmp_path: Path,
+):
+    dataset_path = tmp_path / "test_ds_v2_pack_file_threshold_persists"
+    threshold = 512 * 1024 * 1024
+    schema = pa.schema([lance.blob_field("blob", pack_file_size_threshold=threshold)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-pack-file-size-threshold"
+        ]
+        == str(threshold).encode()
+    )
+
+
+def test_blob_extension_append_rejects_pack_file_threshold_mismatch(tmp_path: Path):
+    dataset_path = tmp_path / "test_ds_v2_append_pack_file_mismatch"
+    initial_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=512 * 1024 * 1024)]
+    )
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=256 * 1024 * 1024)]
+    )
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_dedicated_threshold_precedes_inline_threshold(tmp_path):
+    payload = b"x" * 2048
+    schema = pa.schema(
+        [
+            lance.blob_field(
+                "blob",
+                inline_size_threshold=4096,
+                dedicated_size_threshold=1024,
+            )
+        ]
+    )
+    table = pa.table({"blob": lance.blob_array([payload])}, schema=schema)
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_dedicated_precedes_inline",
+        data_storage_version="2.2",
+    )
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert desc.field("kind").to_pylist() == [2]
+
+
 def test_blob_extension_write_external(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
     blob_path.write_bytes(b"hello")
@@ -533,6 +868,21 @@ def test_blob_extension_write_external(tmp_path):
     assert blob.size() == 5
     with blob as f:
         assert f.read() == b"hello"
+
+
+@pytest.mark.parametrize(
+    ("position", "size"),
+    [
+        pytest.param(None, None, id="explicit_none"),
+        pytest.param(1, 3, id="slice"),
+    ],
+)
+def test_blob_from_uri_accepts_optional_slice_metadata(position, size):
+    blob = Blob.from_uri("file:///tmp/blob.bin", position=position, size=size)
+
+    assert blob.uri == "file:///tmp/blob.bin"
+    assert blob.position == position
+    assert blob.size == size
 
 
 def test_blob_extension_write_external_ingest(tmp_path):
@@ -570,6 +920,348 @@ def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp
         lance.write_dataset(
             table,
             tmp_path / "test_ds_v2_external_ingest_invalid",
+            data_storage_version="2.2",
+            external_blob_mode="ingest",
+            allow_external_blob_outside_bases=True,
+        )
+
+
+def test_blob_extension_add_columns_record_batch_reader_all_kinds(tmp_path):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_reader_blob_v2",
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+    )
+
+    ds.add_columns(pa.table({"blob": lance.blob_array(values)}).to_reader())
+
+    _assert_blob_v2_add_columns_result(ds, "blob", payloads)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        pytest.param("raises_after_first_fragment", id="reader_raises_mid_stream"),
+        pytest.param("wrong_schema", id="reader_yields_wrong_schema"),
+        pytest.param("too_many_rows", id="reader_produces_too_many_rows"),
+    ],
+)
+def test_blob_extension_add_columns_record_batch_reader_failure_cleans_files(
+    tmp_path,
+    failure_mode,
+):
+    ds, dataset_path, values, payloads = _write_two_fragment_blob_v2_seed_dataset(
+        tmp_path,
+        f"test_add_columns_reader_blob_v2_fail_cleanup_{failure_mode}",
+    )
+    external_blob_path = tmp_path / "external_base" / "external_blob.bin"
+    files_before = _dataset_file_set(dataset_path)
+
+    schema = pa.schema([lance.blob_field("blob")])
+    first_fragment_batch = pa.record_batch([lance.blob_array(values)], schema=schema)
+    second_fragment_batch = pa.record_batch([lance.blob_array(values)], schema=schema)
+
+    if failure_mode == "raises_after_first_fragment":
+        match = "reader failed after first fragment"
+
+        def failing_reader():
+            yield first_fragment_batch
+            raise RuntimeError("reader failed after first fragment")
+
+    elif failure_mode == "wrong_schema":
+        match = "field names"
+
+        def failing_reader():
+            yield first_fragment_batch
+            yield pa.record_batch([pa.array(range(4))], ["not_blob"])
+
+    else:
+        match = "Stream produced more values than expected for dataset"
+
+        def failing_reader():
+            yield first_fragment_batch
+            yield second_fragment_batch
+            yield pa.record_batch([lance.blob_array([payloads[0]])], schema=schema)
+
+    with pytest.raises(OSError, match=match):
+        ds.add_columns(failing_reader(), reader_schema=schema)
+
+    assert ds.version == 1
+    assert _dataset_file_set(dataset_path) == files_before
+    assert external_blob_path.exists()
+
+
+def test_blob_extension_add_columns_batch_udf_failure_cleans_files(tmp_path):
+    ds, dataset_path, values, _ = _write_two_fragment_blob_v2_seed_dataset(
+        tmp_path,
+        "test_add_columns_udf_blob_v2_fail_cleanup",
+    )
+    external_blob_path = tmp_path / "external_base" / "external_blob.bin"
+    files_before = _dataset_file_set(dataset_path)
+    call_count = 0
+
+    @lance.batch_udf(output_schema=pa.schema([lance.blob_field("blob")]))
+    def fail_on_second_fragment(batch):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("udf failed after first fragment")
+        blob_values = [values[row.as_py() % len(values)] for row in batch["id"]]
+        return pa.record_batch(
+            [lance.blob_array(blob_values)],
+            ["blob"],
+        )
+
+    with pytest.raises(OSError, match="udf failed after first fragment"):
+        ds.add_columns(fail_on_second_fragment, read_columns=["id"], batch_size=4)
+
+    assert call_count == 2
+    assert ds.version == 1
+    assert _dataset_file_set(dataset_path) == files_before
+    assert external_blob_path.exists()
+
+
+def test_blob_extension_add_columns_batch_udf_all_kinds(tmp_path):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_udf_blob_v2",
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+    )
+
+    @lance.batch_udf(output_schema=pa.schema([lance.blob_field("blob")]))
+    def make_blob_column(batch):
+        return pa.record_batch(
+            [lance.blob_array([values[row.as_py()] for row in batch["id"]])],
+            ["blob"],
+        )
+
+    ds.add_columns(make_blob_column, read_columns=["id"])
+
+    _assert_blob_v2_add_columns_result(ds, "blob", payloads)
+
+
+def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_all_nulls_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    ds.add_columns(lance.blob_field("blob"))
+
+    assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
+    assert ds.take_blobs("blob", indices=range(4)) == []
+
+
+def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
+    tmp_path,
+):
+    dataset_uri = tmp_path / "test_blob_descriptor_array_builder_data_replacement"
+    logical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            lance.blob_field("blob"),
+        ]
+    )
+    initial = pa.table(
+        [
+            pa.array([0], type=pa.uint32()),
+            lance.blob_array([b"initial"]),
+        ],
+        schema=logical_schema,
+    )
+    ds = lance.write_dataset(initial, dataset_uri, data_storage_version="2.2")
+
+    file_id = str(uuid.uuid4())
+    data_file_name = f"{file_id}.lance"
+    blob_id = 1
+    blob_path = _blob_sidecar_path(dataset_uri / "data", file_id, blob_id)
+
+    files = LanceFileSession(dataset_uri / "data")
+    blob_writer = lance.BlobDescriptorArrayBuilder("blob")
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    assert packed.path.endswith(blob_path.relative_to(dataset_uri).as_posix())
+    packed.write_blob(b"replacement")
+    blob_writer.extend(packed.finish())
+
+    physical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            blob_writer.field,
+        ]
+    )
+    replacement = pa.record_batch(
+        [
+            pa.array([1], type=pa.uint32()),
+            blob_writer.finish(),
+        ],
+        schema=physical_schema,
+    )
+
+    with files.open_writer(
+        data_file_name, schema=physical_schema, version="2.2"
+    ) as file_writer:
+        file_writer.write_batch(replacement)
+
+    data_file = lance.fragment.DataFile.create(ds, data_file_name)
+    operation = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    ds = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+
+    assert ds.to_table(columns=["id"]).column("id").to_pylist() == [1]
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+    assert blobs[0].readall() == b"replacement"
+
+
+def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+
+    table = _external_blob_table(blob_path)
+    with pytest.raises(OSError, match="outside registered external bases"):
+        write_fragments(
+            table,
+            tmp_path / "test_fragments_v2_external_denied",
+            data_storage_version="2.2",
+            external_blob_mode="reference",
+        )
+
+
+def test_blob_extension_write_fragments_external_outside_base_allowed(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_allowed"
+
+    table = _external_blob_table(blob_path)
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        allow_external_blob_outside_bases=True,
+    )
+    ds = _commit_blob_fragments(dataset_uri, table.schema, fragments)
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_transaction_external_outside_base_allowed(
+    tmp_path,
+):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_transaction_v2_external_allowed"
+
+    table = _external_blob_table(blob_path)
+    transaction = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        return_transaction=True,
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        allow_external_blob_outside_bases=True,
+    )
+    ds = lance.LanceDataset.commit(dataset_uri, transaction)
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_registered_base(tmp_path):
+    external_base = tmp_path / "external_base"
+    blob_path = external_base / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_registered_base"
+
+    table = _external_blob_table(blob_path)
+    initial_bases = [DatasetBasePath(external_base.as_uri(), name="external", id=1)]
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        initial_bases=initial_bases,
+    )
+    ds = _commit_blob_fragments(
+        dataset_uri,
+        table.schema,
+        fragments,
+        initial_bases=initial_bases,
+    )
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_ingest(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_ingest"
+
+    table = _external_blob_table(blob_path)
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+    ds = _commit_blob_fragments(dataset_uri, table.schema, fragments)
+
+    blob_path.unlink()
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_transaction_external_ingest(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_transaction_v2_external_ingest"
+
+    table = _external_blob_table(blob_path)
+    transaction = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        return_transaction=True,
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+    ds = lance.LanceDataset.commit(dataset_uri, transaction)
+
+    blob_path.unlink()
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_ingest_rejects_reference_only_options(
+    tmp_path,
+):
+    blob_path = tmp_path / "external_blob.bin"
+    message = (
+        "allow_external_blob_outside_bases only applies when "
+        'external_blob_mode="reference"'
+    )
+
+    table = _external_blob_table(blob_path)
+    with pytest.raises(OSError, match=message):
+        write_fragments(
+            table,
+            tmp_path / "test_fragments_v2_external_ingest_invalid",
             data_storage_version="2.2",
             external_blob_mode="ingest",
             allow_external_blob_outside_bases=True,
@@ -732,6 +1424,60 @@ def dataset_for_pandas_blob_tests(tmp_path):
     return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
 
 
+@pytest.fixture
+def dataset_for_pandas_no_blob_tests(tmp_path):
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "name": pa.array(["one", "two", "three"], pa.string()),
+            "bin": pa.array([b"x", b"y", b"z"], pa.large_binary()),
+        }
+    )
+    return lance.write_dataset(table, tmp_path / "no_blob_pandas_ds")
+
+
+@pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
+def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
+    dataset_for_pandas_no_blob_tests,
+    source,
+):
+    kwargs = {"types_mapper": pd.ArrowDtype}
+    ds = dataset_for_pandas_no_blob_tests
+
+    if source == "dataset":
+        actual = ds.to_pandas(**kwargs)
+        expected = ds.to_table().to_pandas(**kwargs)
+    elif source == "scanner":
+        scanner = ds.scanner(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+            batch_size=1,
+        )
+        actual = scanner.to_pandas(**kwargs)
+        expected = scanner.to_table().to_pandas(**kwargs)
+    else:
+        fragment = ds.get_fragments()[0]
+        actual = fragment.to_pandas(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+            batch_size=1,
+            **kwargs,
+        )
+        expected = fragment.to_table(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+        ).to_pandas(**kwargs)
+
+    pd.testing.assert_frame_equal(actual, expected)
+    assert actual.dtypes["id"] == pd.ArrowDtype(pa.int64())
+
+
 def test_dataset_to_pandas_blob_lazy(dataset_for_pandas_blob_tests):
     df = dataset_for_pandas_blob_tests.to_pandas()
 
@@ -785,6 +1531,29 @@ def test_scanner_to_pandas_blob_filter_limit_order(dataset_for_pandas_blob_tests
     assert df["blob"].tolist() == [None]
 
 
+@pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
+def test_to_pandas_blob_scan_parameters(dataset_for_pandas_blob_tests, source):
+    ds = dataset_for_pandas_blob_tests
+    scan_kwargs = {
+        "columns": ["id", "blob"],
+        "filter": "id > 1",
+        "limit": 1,
+        "offset": 1,
+        "batch_size": 1,
+    }
+
+    if source == "dataset":
+        df = ds.to_pandas(**scan_kwargs, blob_mode="bytes")
+    elif source == "scanner":
+        df = ds.scanner(**scan_kwargs).to_pandas(blob_mode="bytes")
+    else:
+        df = ds.get_fragments()[0].to_pandas(**scan_kwargs, blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["id"].tolist() == [3]
+    assert df["blob"].tolist() == [b"world"]
+
+
 def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
     df = dataset_for_pandas_blob_tests.scanner(
         columns=["id", "blob"], filter="id > 10"
@@ -796,7 +1565,7 @@ def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
 
 def test_fragment_to_pandas_blob(dataset_for_pandas_blob_tests):
     fragment = dataset_for_pandas_blob_tests.get_fragments()[0]
-    df = fragment.to_pandas(columns=["id", "blob"], blob_mode="bytes")
+    df = fragment.to_pandas(columns=["id", "blob"], batch_size=1, blob_mode="bytes")
 
     assert list(df.columns) == ["id", "blob"]
     assert df["blob"].tolist() == [b"hello", None, b"world"]
@@ -807,21 +1576,129 @@ def test_dataset_to_pandas_invalid_blob_mode(dataset_for_pandas_blob_tests):
         dataset_for_pandas_blob_tests.to_pandas(blob_mode="inline")
 
 
-def test_blob_column_sources_rejects_unmappable_transform(
-    dataset_for_pandas_blob_tests,
-):
-    projected_schema = pa.schema(
-        [
-            pa.field(
-                "video",
-                pa.large_binary(),
-                metadata={"lance-encoding:blob": "true"},
-            )
-        ]
+@pytest.fixture
+def dataset_with_nested_blobs(tmp_path):
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
     )
-    snapshot = {"_columns_with_transform": (("video", "concat(blob, blob)"),)}
+    info_type = pa.struct([pa.field("name", pa.string()), blob_field])
+    info_array = pa.array(
+        [
+            {"name": "a", "blob": b"foo"},
+            {"name": "b", "blob": None},
+            {"name": "c", "blob": b"baz"},
+        ],
+        type=info_type,
+    )
+    table = pa.table(
+        [pa.array([1, 2, 3], pa.int64()), info_array],
+        schema=pa.schema([pa.field("id", pa.int64()), pa.field("info", info_type)]),
+    )
+    return lance.write_dataset(table, tmp_path / "nested_blob_ds")
 
-    with pytest.raises(NotImplementedError, match="direct blob column references"):
-        lance_dataset_module._blob_column_sources(
-            projected_schema, snapshot, dataset_for_pandas_blob_tests.schema
-        )
+
+def test_to_pandas_returns_blob_file_handles_for_nested_fields(
+    dataset_with_nested_blobs,
+):
+    df = dataset_with_nested_blobs.to_pandas()
+    row0, row1, row2 = df["info"].tolist()
+
+    assert row0["blob"].readall() == b"foo"
+    assert row1["blob"] is None
+    assert row2["blob"].readall() == b"baz"
+
+
+def test_to_pandas_reads_nested_blob_bytes_directly(dataset_with_nested_blobs):
+    rows = dataset_with_nested_blobs.to_pandas(blob_mode="bytes")["info"].tolist()
+
+    assert [r["blob"] for r in rows] == [b"foo", None, b"baz"]
+
+
+def test_to_pandas_returns_descriptors_for_nested_fields(dataset_with_nested_blobs):
+    descriptions_df = dataset_with_nested_blobs.to_pandas(blob_mode="descriptions")
+    table_df = dataset_with_nested_blobs.to_table().to_pandas()
+
+    assert descriptions_df.equals(table_df)
+
+
+def test_take_blobs_resolves_nested_field_path(dataset_with_nested_blobs):
+    blobs = dataset_with_nested_blobs.take_blobs("info.blob", indices=[0, 2])
+
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+    with blobs[1] as f:
+        assert f.read() == b"baz"
+
+
+def test_read_blobs_resolves_nested_field_path(dataset_with_nested_blobs):
+    results = dataset_with_nested_blobs.read_blobs("info.blob", indices=[0, 2])
+
+    assert [data for _, data in results] == [b"foo", b"baz"]
+
+
+def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
+    packed = b"x" * (70 * 1024)
+    blob_field = lance.blob_field("blob")
+    info_fields = [pa.field("name", pa.string()), blob_field]
+    info_type = pa.struct(info_fields)
+    info_array = pa.StructArray.from_arrays(
+        [pa.array(["a", "b", "c"]), lance.blob_array([b"foo", packed, None])],
+        fields=info_fields,
+    )
+    table = pa.table(
+        [info_array],
+        schema=pa.schema([pa.field("info", info_type)]),
+    )
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "nested_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    desc = dataset.to_table(columns=["info.blob"]).column("info.blob").chunk(0)
+    assert desc.field("kind").to_pylist()[:2] == [0, 1]
+
+    blobs = dataset.take_blobs("info.blob", indices=[0, 1])
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+    with blobs[1] as f:
+        assert f.read() == packed
+
+    assert dataset.take_blobs("info.blob", indices=[2]) == []
+
+
+def test_to_pandas_returns_blob_files_for_projected_nested_fields(
+    dataset_with_nested_blobs,
+):
+    images = (
+        dataset_with_nested_blobs.scanner(columns=["info.blob"])
+        .to_pandas()["info.blob"]
+        .tolist()
+    )
+
+    assert images[0].readall() == b"foo"
+    assert images[1] is None
+    assert images[2].readall() == b"baz"
+
+
+def test_to_pandas_reads_bytes_for_projected_nested_fields(dataset_with_nested_blobs):
+    df = dataset_with_nested_blobs.scanner(columns=["info.blob"]).to_pandas(
+        blob_mode="bytes"
+    )
+
+    assert df["info.blob"].tolist() == [b"foo", None, b"baz"]
+
+
+def test_to_pandas_returns_blob_files_when_nested_field_is_aliased(
+    dataset_with_nested_blobs,
+):
+    images = (
+        dataset_with_nested_blobs.scanner(columns={"my_img": "info.blob"})
+        .to_pandas()["my_img"]
+        .tolist()
+    )
+
+    assert images[0].readall() == b"foo"
+    assert images[1] is None
+    assert images[2].readall() == b"baz"

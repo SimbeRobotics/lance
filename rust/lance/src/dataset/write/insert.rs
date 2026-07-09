@@ -19,10 +19,13 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
+use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
+use crate::dataset::write::{
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+};
 use crate::{Error, Result};
 use tracing::info;
 
@@ -201,8 +204,14 @@ impl<'a> InsertBuilder<'a> {
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
-        let target_base_info =
-            validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
+        let target_base_info = validate_and_resolve_target_bases_with_primary(
+            &mut context.params,
+            existing_base_paths,
+            &context.object_store,
+            &context.base_path,
+            &context.dest.uri(),
+        )
+        .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
             context.dest.dataset(),
@@ -315,7 +324,8 @@ impl<'a> InsertBuilder<'a> {
                 ..Default::default()
             };
 
-            data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
+            normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
         // Make sure we aren't using any reserved column names
@@ -442,7 +452,7 @@ struct WriteContext<'a> {
 mod test {
     use std::collections::HashMap;
 
-    use arrow_array::{BinaryArray, Int32Array, RecordBatchReader, StructArray};
+    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
 
@@ -553,6 +563,41 @@ mod test {
             Error::InvalidInput { source, .. } => {
                 let message = source.to_string();
                 assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("lance.blob.v2"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_v2_2_dataset_rejects_nested_legacy_blob_schema() {
+        let image_field = Field::new("image_bytes", DataType::Binary, true).with_metadata(
+            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "summary_image_nested",
+            DataType::Struct(vec![image_field.clone()].into()),
+            true,
+        )]));
+        let image_values: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]));
+        let nested_values = StructArray::from(vec![(Arc::new(image_field), image_values)]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
+
+        let dataset = InsertBuilder::new("memory://forced-nested-blob-v2")
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = dataset.unwrap_err();
+        match err {
+            Error::InvalidInput { source, .. } => {
+                let message = source.to_string();
+                assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("summary_image_nested.image_bytes"));
                 assert!(message.contains("lance.blob.v2"));
             }
             other => panic!("unexpected error: {other:?}"),

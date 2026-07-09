@@ -30,10 +30,14 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
+use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
+#[cfg(test)]
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+    UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -59,7 +63,21 @@ use tracing::{debug, warn};
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
-        source.to_string().contains("retries, max_retries")
+        let message = source.to_string();
+        let lowercase = message.to_ascii_lowercase();
+        lowercase.contains("retries, max_retries")
+            || lowercase.contains("serverbusy")
+            || lowercase.contains("server busy")
+            || lowercase.contains("egress is over the account limit")
+            || lowercase.contains("http 429")
+            || lowercase.contains("status code: 429")
+            || lowercase.contains("429 too many requests")
+            || lowercase.contains("too many requests")
+            || lowercase.contains("slowdown")
+            || lowercase.contains("please reduce your request rate")
+            || lowercase.contains("rate limit")
+            || lowercase.contains("throttling")
+            || lowercase.contains("throttled")
     } else {
         false
     }
@@ -79,7 +97,7 @@ pub struct AimdThrottleConfig {
     pub write: AimdConfig,
     /// AIMD configuration for delete operations.
     pub delete: AimdConfig,
-    /// AIMD configuration for list operations (list_with_delimiter).
+    /// AIMD configuration for list operations.
     pub list: AimdConfig,
     /// Maximum tokens that can accumulate for bursts (shared across all categories).
     pub burst_capacity: u32,
@@ -300,7 +318,7 @@ impl AimdThrottleConfig {
 
 struct TokenBucketState {
     tokens: f64,
-    last_refill: std::time::Instant,
+    last_refill: tokio::time::Instant,
     rate: f64,
 }
 
@@ -328,7 +346,7 @@ impl OperationThrottle {
             controller,
             bucket: Mutex::new(TokenBucketState {
                 tokens: burst_capacity,
-                last_refill: std::time::Instant::now(),
+                last_refill: tokio::time::Instant::now(),
                 rate: initial_rate,
             }),
             burst_capacity,
@@ -346,7 +364,7 @@ impl OperationThrottle {
     async fn acquire_token(&self) {
         let sleep_duration = {
             let mut bucket = self.bucket.lock().await;
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
             bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
             bucket.last_refill = now;
@@ -380,17 +398,25 @@ impl OperationThrottle {
         let outcome = match result {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected in stream");
+                debug!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    error = %err,
+                    "Throttle error detected in stream"
+                );
                 RequestOutcome::Throttled
             }
             Err(_) => RequestOutcome::Success,
         };
         let prev_rate = self.controller.current_rate();
         let new_rate = self.controller.record_outcome(outcome);
-        if new_rate < prev_rate {
+        if new_rate < prev_rate
+            && let Err(err) = result.as_ref()
+        {
             warn!(
+                target: TRACE_OBJECT_STORE_THROTTLE,
                 previous_rate = format!("{prev_rate:.1}"),
                 new_rate = format!("{new_rate:.1}"),
+                error = %err,
                 "AIMD throttle: rate reduced due to throttle errors"
             );
         }
@@ -413,17 +439,25 @@ impl OperationThrottle {
             let outcome = match &result {
                 Ok(_) => RequestOutcome::Success,
                 Err(err) if is_throttle_error(err) => {
-                    debug!("Throttle error detected");
+                    debug!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        error = %err,
+                        "Throttle error detected"
+                    );
                     RequestOutcome::Throttled
                 }
                 Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
             };
             let prev_rate = self.controller.current_rate();
             let new_rate = self.controller.record_outcome(outcome);
-            if new_rate < prev_rate {
+            if new_rate < prev_rate
+                && let Err(err) = result.as_ref()
+            {
                 warn!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
                     previous_rate = format!("{prev_rate:.1}"),
                     new_rate = format!("{new_rate:.1}"),
+                    error = %err,
                     "AIMD throttle: rate reduced due to throttle errors"
                 );
             }
@@ -434,9 +468,11 @@ impl OperationThrottle {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         backoff_ms,
+                        error = %err,
                         "Retrying after throttle error"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -535,11 +571,11 @@ impl MultipartUpload for ThrottledMultipartUpload {
 /// - **read**: `get`, `get_opts`, `get_range`, `get_ranges`, `head`
 /// - **write**: `put`, `put_opts`, `put_multipart`, `put_multipart_opts`, `copy`, `copy_if_not_exists`, `rename`, `rename_if_not_exists`
 /// - **delete**: `delete`
-/// - **list**: `list_with_delimiter`
+/// - **list**: `list`, `list_with_offset`, `list_with_delimiter`
 ///
-/// Streaming operations (`list`, `list_with_offset`, `delete_stream`) do not acquire tokens,
-/// but observe each yielded item and feed the result back to the AIMD controller so it can
-/// adjust the rate for other operations in the same category.
+/// Streaming list operations acquire a token before starting the underlying list stream.
+/// Streaming operations also observe each yielded item and feed the result back to the
+/// AIMD controller so it can adjust the rate for other operations in the same category.
 ///
 /// This is not perfect but probably as close as we can get without moving the throttle into
 /// the object_store crate itself.
@@ -615,12 +651,6 @@ impl AimdThrottledStore {
 #[async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for AimdThrottledStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        self.write
-            .throttled(|| self.target.put(location, bytes.clone()))
-            .await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -630,17 +660,6 @@ impl ObjectStore for AimdThrottledStore {
         self.write
             .throttled(|| self.target.put_opts(location, bytes.clone(), opts.clone()))
             .await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        let target = self
-            .write
-            .throttled(|| self.target.put_multipart(location))
-            .await?;
-        Ok(Box::new(ThrottledMultipartUpload {
-            target,
-            write: Arc::clone(&self.write),
-        }))
     }
 
     async fn put_multipart_opts(
@@ -658,19 +677,9 @@ impl ObjectStore for AimdThrottledStore {
         }))
     }
 
-    async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        self.read.throttled(|| self.target.get(location)).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.read
             .throttled(|| self.target.get_opts(location, options.clone()))
-            .await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        self.read
-            .throttled(|| self.target.get_range(location, range.clone()))
             .await
     }
 
@@ -680,22 +689,15 @@ impl ObjectStore for AimdThrottledStore {
             .await
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.read.throttled(|| self.target.head(location)).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.delete.throttled(|| self.target.delete(location)).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, OSResult<Path>>,
-    ) -> BoxStream<'a, OSResult<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        let delete = Arc::clone(&self.delete);
         self.target
             .delete_stream(locations)
-            .map(|item| {
-                self.delete.observe_outcome(&item);
+            .map(move |item| {
+                delete.observe_outcome(&item);
                 item
             })
             .boxed()
@@ -703,13 +705,19 @@ impl ObjectStore for AimdThrottledStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let throttle = Arc::clone(&self.list);
-        self.target
-            .list(prefix)
-            .map(move |item| {
-                throttle.observe_outcome(&item);
-                item
-            })
-            .boxed()
+        let throttle_for_start = Arc::clone(&throttle);
+        let target = Arc::clone(&self.target);
+        let prefix = prefix.cloned();
+        futures::stream::once(async move {
+            throttle_for_start.acquire_token().await;
+            target.list(prefix.as_ref())
+        })
+        .flatten()
+        .map(move |item| {
+            throttle.observe_outcome(&item);
+            item
+        })
+        .boxed()
     }
 
     fn list_with_offset(
@@ -718,13 +726,20 @@ impl ObjectStore for AimdThrottledStore {
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let throttle = Arc::clone(&self.list);
-        self.target
-            .list_with_offset(prefix, offset)
-            .map(move |item| {
-                throttle.observe_outcome(&item);
-                item
-            })
-            .boxed()
+        let throttle_for_start = Arc::clone(&throttle);
+        let target = Arc::clone(&self.target);
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        futures::stream::once(async move {
+            throttle_for_start.acquire_token().await;
+            target.list_with_offset(prefix.as_ref(), &offset)
+        })
+        .flatten()
+        .map(move |item| {
+            throttle.observe_outcome(&item);
+            item
+        })
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -733,23 +748,15 @@ impl ObjectStore for AimdThrottledStore {
             .await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.write.throttled(|| self.target.copy(from, to)).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.write.throttled(|| self.target.rename(from, to)).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.write
-            .throttled(|| self.target.rename_if_not_exists(from, to))
+            .throttled(|| self.target.copy_opts(from, to, opts.clone()))
             .await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         self.write
-            .throttled(|| self.target.copy_if_not_exists(from, to))
+            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
             .await
     }
 }
@@ -760,7 +767,9 @@ mod tests {
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
     fn make_generic_error(msg: &str) -> object_store::Error {
         object_store::Error::Generic {
@@ -778,8 +787,10 @@ mod tests {
     #[case::not_found("Object not found", false)]
     #[case::permission_denied("Access denied", false)]
     #[case::timeout("Connection timed out", false)]
-    #[case::http_429_without_retries("HTTP 429 Too Many Requests", false)]
-    #[case::slowdown_without_retries("SlowDown: Please reduce your request rate", false)]
+    #[case::http_429_without_retries("HTTP 429 Too Many Requests", true)]
+    #[case::slowdown_without_retries("SlowDown: Please reduce your request rate", true)]
+    #[case::azure_server_busy("Code: ServerBusy", true)]
+    #[case::azure_egress_limit("Message: Egress is over the account limit", true)]
     fn test_is_throttle_error(#[case] msg: &str, #[case] expected: bool) {
         let err = make_generic_error(msg);
         assert_eq!(
@@ -966,9 +977,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for ThrottlingListMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
         async fn put_opts(
             &self,
             location: &Path,
@@ -977,9 +985,6 @@ mod tests {
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
         }
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
         async fn put_multipart_opts(
             &self,
             location: &Path,
@@ -987,28 +992,16 @@ mod tests {
         ) -> OSResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
-            self.inner.get(location).await
-        }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.inner.get_opts(location, options).await
-        }
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            self.inner.get_range(location, range).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            self.inner.head(location).await
-        }
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -1033,17 +1026,8 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 
@@ -1094,6 +1078,180 @@ mod tests {
             new_rate,
             initial_rate
         );
+    }
+
+    struct CountingListStartStore {
+        inner: InMemory,
+        list_calls: AtomicUsize,
+        offset_calls: AtomicUsize,
+    }
+
+    impl Default for CountingListStartStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemory::new(),
+                list_calls: AtomicUsize::new(0),
+                offset_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CountingListStartStore {
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+
+        fn offset_calls(&self) -> usize {
+            self.offset_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Display for CountingListStartStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingListStartStore")
+        }
+    }
+
+    impl Debug for CountingListStartStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CountingListStartStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingListStartStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.offset_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    fn list_start_throttle_config() -> AimdThrottleConfig {
+        // Use a low rate (10 tokens/s) so that the token-acquisition sleep is
+        // 1/10 = 100 ms — well above the 50 ms timeout used in assertions,
+        // avoiding flakiness from coarse OS timer resolution (e.g. Windows ~16 ms).
+        AimdThrottleConfig::default()
+            .with_burst_capacity(0)
+            .with_list_aimd(AimdConfig::default().with_initial_rate(10.0))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_list_acquires_token_before_starting_underlying_stream() {
+        let store = Arc::new(CountingListStartStore::default());
+        store
+            .put(
+                &Path::from("prefix/file.txt"),
+                PutPayload::from_static(b"data"),
+            )
+            .await
+            .unwrap();
+        let throttled = AimdThrottledStore::new(
+            store.clone() as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+
+        let mut stream = throttled.list(Some(&Path::from("prefix")));
+        assert_eq!(store.list_calls(), 0);
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition
+        // sleeps for 100 ms. A 50 ms timeout must expire before that.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_calls(), 0);
+
+        let item = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.location, Path::from("prefix/file.txt"));
+        assert_eq!(store.list_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_list_with_offset_acquires_token_before_starting_underlying_stream() {
+        let store = Arc::new(CountingListStartStore::default());
+        store
+            .put(&Path::from("prefix/b"), PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+        let throttled = AimdThrottledStore::new(
+            store.clone() as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+
+        let mut stream =
+            throttled.list_with_offset(Some(&Path::from("prefix")), &Path::from("prefix/a"));
+        assert_eq!(store.offset_calls(), 0);
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition
+        // sleeps for 100 ms. A 50 ms timeout must expire before that.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.offset_calls(), 0);
+
+        let item = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.location, Path::from("prefix/b"));
+        assert_eq!(store.offset_calls(), 1);
     }
 
     #[tokio::test]
@@ -1196,8 +1354,7 @@ mod tests {
         fn throttle_error() -> object_store::Error {
             object_store::Error::Generic {
                 store: "RateLimitingMock",
-                source: "request failed, after 10 retries, max_retries: 10, retry_timeout: 180s"
-                    .into(),
+                source: THROTTLE_ERROR_RESPONSE.into(),
             }
         }
     }
@@ -1216,10 +1373,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for RateLimitingMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
-
         async fn put_opts(
             &self,
             location: &Path,
@@ -1227,10 +1380,6 @@ mod tests {
             opts: PutOptions,
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
-        }
-
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
         }
 
         async fn put_multipart_opts(
@@ -1241,25 +1390,9 @@ mod tests {
             self.inner.put_multipart_opts(location, opts).await
         }
 
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
-            if self.check_rate() {
-                self.inner.get(location).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             if self.check_rate() {
                 self.inner.get_opts(location, options).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            if self.check_rate() {
-                self.inner.get_range(location, range).await
             } else {
                 Err(Self::throttle_error())
             }
@@ -1273,22 +1406,10 @@ mod tests {
             }
         }
 
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            if self.check_rate() {
-                self.inner.head(location).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
@@ -1308,20 +1429,8 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 
@@ -1460,9 +1569,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for RetryTestMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
         async fn put_opts(
             &self,
             location: &Path,
@@ -1471,9 +1577,6 @@ mod tests {
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
         }
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
         async fn put_multipart_opts(
             &self,
             location: &Path,
@@ -1481,7 +1584,7 @@ mod tests {
         ) -> OSResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.get_call_count.fetch_add(1, Ordering::Relaxed);
             let should_error = {
                 let mut remaining = self.errors_remaining.lock().unwrap();
@@ -1495,32 +1598,19 @@ mod tests {
             if should_error {
                 Err(object_store::Error::Generic {
                     store: "RetryTestMock",
-                    source: "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
-                        .into(),
+                    source: THROTTLE_ERROR_RESPONSE.into(),
                 })
             } else {
-                self.inner.get(location).await
+                self.inner.get_opts(location, options).await
             }
-        }
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            self.inner.get_range(location, range).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            self.inner.head(location).await
-        }
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -1536,17 +1626,8 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 
@@ -1589,7 +1670,13 @@ mod tests {
 
         let result = throttled.get(&path).await;
         assert!(result.is_err(), "Expected error after max retries");
-        assert!(is_throttle_error(&result.unwrap_err()));
+        let err = result.unwrap_err();
+        assert!(is_throttle_error(&err));
+
+        let lance_error = lance_core::Error::from(err);
+        let error_message = lance_error.to_string();
+        assert!(error_message.contains("x-ms-request-id"));
+        assert!(error_message.contains("azure-request-id"));
 
         // Should have called get 4 times: initial attempt + 3 retries
         assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);

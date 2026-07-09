@@ -175,7 +175,17 @@ impl FixedWidthDataBlock {
         num_values: u64,
         validate: bool,
     ) -> Result<ArrayData> {
-        let data_buffer = self.data.into_buffer();
+        // Booleans expanded for full-zip (bits_per_value==8, one byte each) need re-packing to
+        // Arrow's bit-packed format.
+        let data_buffer = if matches!(data_type, DataType::Boolean) && self.bits_per_value == 8 {
+            let mut builder = BooleanBufferBuilder::new(num_values as usize);
+            for &byte in self.data.as_ref().iter().take(num_values as usize) {
+                builder.append(byte != 0);
+            }
+            builder.finish().into_inner()
+        } else {
+            self.data.into_buffer()
+        };
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(data_buffer)
             .len(num_values as usize)
@@ -1454,8 +1464,26 @@ impl DataBlock {
 
         let mut encoded = match data_type {
             DataType::Binary | DataType::Utf8 => arrow_binary_to_data_block(arrays, num_values, 32),
-            DataType::BinaryView | DataType::Utf8View => {
-                todo!()
+            // View types have no Lance disk representation; cast to the classic offset layout.
+            DataType::Utf8View => {
+                let casted: Vec<ArrayRef> = arrays
+                    .iter()
+                    .map(|a| {
+                        arrow_cast::cast(a.as_ref(), &DataType::Utf8)
+                            .expect("Utf8View to Utf8 cast is always valid")
+                    })
+                    .collect();
+                arrow_binary_to_data_block(&casted, num_values, 32)
+            }
+            DataType::BinaryView => {
+                let casted: Vec<ArrayRef> = arrays
+                    .iter()
+                    .map(|a| {
+                        arrow_cast::cast(a.as_ref(), &DataType::Binary)
+                            .expect("BinaryView to Binary cast is always valid")
+                    })
+                    .collect();
+                arrow_binary_to_data_block(&casted, num_values, 32)
             }
             DataType::LargeBinary | DataType::LargeUtf8 => {
                 arrow_binary_to_data_block(arrays, num_values, 64)
@@ -1624,8 +1652,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
-        UInt16Array, make_array, new_null_array,
+        ArrayRef, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, make_array, new_null_array,
         types::{Int8Type, Int32Type},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
@@ -1702,6 +1730,58 @@ mod tests {
         let data = block.as_variable_width().unwrap();
         assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(vec![0, 1, 3, 6]));
         assert_eq!(data.data, LanceBuffer::copy_slice(b"abcdef"));
+    }
+
+    #[test]
+    fn test_string_view_to_data_block() {
+        let views1 = StringViewArray::from(vec![Some("hello"), None, Some("world")]);
+        let views2 = StringViewArray::from(vec![Some("a"), Some("b")]);
+        let views3 = StringViewArray::from(vec![Option::<&'static str>::None, None]);
+
+        let arrays = &[views1, views2, views3]
+            .iter()
+            .map(|arr| Arc::new(arr.clone()) as ArrayRef)
+            .collect::<Vec<_>>();
+
+        let block = DataBlock::from_arrays(arrays, 7);
+
+        assert_eq!(block.num_values(), 7);
+        let block = block.as_nullable().unwrap();
+        assert_eq!(block.nulls, LanceBuffer::from(vec![0b00011101]));
+        let data = block.data.as_variable_width().unwrap();
+        assert_eq!(
+            data.offsets,
+            LanceBuffer::reinterpret_vec(vec![0, 5, 5, 10, 11, 12, 12, 12])
+        );
+        assert_eq!(data.data, LanceBuffer::copy_slice(b"helloworldab"));
+
+        let views1 = StringViewArray::from(vec![Some("a"), Some("bc")]);
+        let views2 = StringViewArray::from(vec![Some("def")]);
+
+        let arrays = &[views1, views2]
+            .iter()
+            .map(|arr| Arc::new(arr.clone()) as ArrayRef)
+            .collect::<Vec<_>>();
+
+        let block = DataBlock::from_arrays(arrays, 3);
+
+        assert_eq!(block.num_values(), 3);
+        let data = block.as_variable_width().unwrap();
+        assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(vec![0, 1, 3, 6]));
+        assert_eq!(data.data, LanceBuffer::copy_slice(b"abcdef"));
+    }
+
+    #[test]
+    fn test_binary_view_to_data_block() {
+        let arr: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+            Some(b"foo".as_slice()),
+            None,
+            Some(b"bar".as_slice()),
+        ]));
+        let block = DataBlock::from_arrays(&[arr], 3);
+        let block = block.as_nullable().unwrap();
+        let data = block.data.as_variable_width().unwrap();
+        assert_eq!(data.data, LanceBuffer::copy_slice(b"foobar"));
     }
 
     #[test]

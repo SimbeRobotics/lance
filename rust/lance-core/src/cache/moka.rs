@@ -11,13 +11,19 @@ use futures::Future;
 use crate::Result;
 
 use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
 struct MokaCacheEntry {
     entry: CacheEntry,
     size_bytes: usize,
+}
+
+/// Per-entry key cost for eviction: the struct plus the unique `key` bytes.
+/// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
+fn key_footprint(key: &InternalCacheKey) -> usize {
+    std::mem::size_of::<InternalCacheKey>() + key.key().len()
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
@@ -40,7 +46,12 @@ impl MokaCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(capacity as u64)
-            .weigher(|_, v: &MokaCacheEntry| v.size_bytes.try_into().unwrap_or(u32::MAX))
+            .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
+                key_footprint(key)
+                    .saturating_add(entry.size_bytes)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
             .support_invalidation_closures()
             .build();
         Self { cache }
@@ -123,6 +134,13 @@ impl CacheBackend for MokaCacheBackend {
         self.cache.run_pending_tasks().await;
     }
 
+    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        self.cache.run_pending_tasks().await;
+        Some(Box::new(
+            self.cache.iter().map(|(key, _)| key.as_ref().clone()),
+        ))
+    }
+
     async fn num_entries(&self) -> usize {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count() as usize
@@ -141,6 +159,9 @@ impl CacheBackend for MokaCacheBackend {
         // Iterate rather than using `weighted_size()` because moka's
         // weighted_size can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
-        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
+        self.cache
+            .iter()
+            .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
+            .sum()
     }
 }

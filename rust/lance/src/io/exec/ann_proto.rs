@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Protobuf serialization for [`ANNIvfSubIndexExec`].
+//! Protobuf serialization for [`ANNIvfPartitionExec`] and [`ANNIvfSubIndexExec`].
 //!
 //! Proto message definitions live in `crate::pb` (compiled from `ann.proto`).
 //! Conversion functions live here because they need access to `ANNIvfSubIndexExec`
@@ -16,15 +16,16 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
-use lance_index::vector::Query;
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::pb;
 
-use super::knn::ANNIvfSubIndexExec;
+use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
 use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
@@ -79,6 +80,22 @@ fn query_vector_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
     Ok(batches[0].column(0).clone())
 }
 
+fn approx_mode_to_proto(mode: ApproxMode) -> pb::VectorApproxMode {
+    match mode {
+        ApproxMode::Fast => pb::VectorApproxMode::Fast,
+        ApproxMode::Normal => pb::VectorApproxMode::Normal,
+        ApproxMode::Accurate => pb::VectorApproxMode::Accurate,
+    }
+}
+
+fn approx_mode_from_proto(value: i32) -> ApproxMode {
+    match pb::VectorApproxMode::try_from(value).unwrap_or(pb::VectorApproxMode::Normal) {
+        pb::VectorApproxMode::Fast => ApproxMode::Fast,
+        pb::VectorApproxMode::Normal => ApproxMode::Normal,
+        pb::VectorApproxMode::Accurate => ApproxMode::Accurate,
+    }
+}
+
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
     let query_vector_arrow_ipc = query_vector_to_ipc_bytes(query.key.as_ref())?;
 
@@ -99,6 +116,8 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         metric_type,
         use_index: query.use_index,
         dist_q_c: Some(query.dist_q_c),
+        query_parallelism: Some(query.query_parallelism),
+        approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
     })
 }
 
@@ -126,8 +145,59 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
+        query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
+        approx_mode: approx_mode_from_proto(proto.approx_mode),
     })
+}
+
+// =============================================================================
+// ANNIvfPartitionExec <-> Proto
+// =============================================================================
+
+/// Convert an [`ANNIvfPartitionExec`] to proto for serialization.
+pub async fn ann_ivf_partition_exec_to_proto(
+    exec: &ANNIvfPartitionExec,
+) -> Result<pb::AnnIvfPartitionExecProto> {
+    let table = table_identifier_from_dataset(&exec.dataset).await?;
+    let query = query_to_proto(&exec.query)?;
+
+    Ok(pb::AnnIvfPartitionExecProto {
+        query: Some(query),
+        table: Some(table),
+        index_uuids: exec.index_uuids.iter().map(Uuid::to_string).collect(),
+    })
+}
+
+/// Reconstruct an [`ANNIvfPartitionExec`] from proto.
+pub async fn ann_ivf_partition_exec_from_proto(
+    proto: pb::AnnIvfPartitionExecProto,
+    dataset: Option<Arc<Dataset>>,
+) -> Result<ANNIvfPartitionExec> {
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
+
+    let query_proto = proto.query.ok_or_else(|| {
+        Error::invalid_input_source("Missing VectorQueryProto in ANNIvfPartitionExecProto".into())
+    })?;
+    let query = query_from_proto(query_proto)?;
+
+    if proto.index_uuids.is_empty() {
+        return Err(Error::invalid_input_source(
+            "ANNIvfPartitionExecProto contains no index UUIDs".into(),
+        ));
+    }
+
+    let index_uuids: Vec<Uuid> = proto
+        .index_uuids
+        .iter()
+        .map(|s| Uuid::parse_str(s))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| {
+            Error::invalid_input_source(
+                format!("Invalid UUID in AnnIvfPartitionExecProto: {e}").into(),
+            )
+        })?;
+    ANNIvfPartitionExec::try_new(dataset, index_uuids, query)
 }
 
 // =============================================================================
@@ -144,23 +214,34 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
     let indices: Vec<table_pb::IndexMetadata> =
         exec.indices().iter().map(|idx| idx.into()).collect();
 
+    let prefilter_type = match exec.prefilter_source() {
+        PreFilterSource::None => pb::ann_ivf_sub_index_exec_proto::PreFilterType::None as i32,
+        PreFilterSource::FilteredRowIds(_) => {
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::FilteredRowIds as i32
+        }
+        PreFilterSource::ScalarIndexQuery(_) => {
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::ScalarIndexQuery as i32
+        }
+    };
+
     Ok(pb::AnnIvfSubIndexExecProto {
         query: Some(query),
         table: Some(table),
         indices,
+        prefilter_type,
     })
 }
 
 /// Reconstruct an [`ANNIvfSubIndexExec`] from proto.
 ///
-/// The caller (codec) is responsible for extracting child inputs:
-/// - `input`: the child execution plan (e.g. partition exec)
-/// - `prefilter_source`: optional prefilter input
+/// The caller (codec) is responsible for providing deserialized child inputs.
+/// The `prefilter_type` field from the proto determines which `PreFilterSource`
+/// variant wraps the optional second child input.
 pub async fn ann_ivf_sub_index_exec_from_proto(
     proto: pb::AnnIvfSubIndexExecProto,
     dataset: Option<Arc<Dataset>>,
     input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    prefilter_source: PreFilterSource,
+    prefilter_input: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
 ) -> Result<ANNIvfSubIndexExec> {
     let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
@@ -180,6 +261,32 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
             "ANNIvfSubIndexExecProto contains no indices".into(),
         ));
     }
+
+    use pb::ann_ivf_sub_index_exec_proto::PreFilterType;
+    let prefilter_type = PreFilterType::try_from(proto.prefilter_type).map_err(|_| {
+        Error::invalid_input_source(
+            format!("Invalid PreFilterType value: {}", proto.prefilter_type).into(),
+        )
+    })?;
+
+    let prefilter_source = match (prefilter_type, prefilter_input) {
+        (PreFilterType::None, None) => PreFilterSource::None,
+        (PreFilterType::FilteredRowIds, Some(plan)) => PreFilterSource::FilteredRowIds(plan),
+        (PreFilterType::ScalarIndexQuery, Some(plan)) => PreFilterSource::ScalarIndexQuery(plan),
+        (PreFilterType::None, Some(_)) => {
+            return Err(Error::invalid_input_source(
+                "ANNIvfSubIndexExecProto: prefilter_type is None but a prefilter child was provided".into(),
+            ));
+        }
+        (_, None) => {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "ANNIvfSubIndexExecProto: prefilter_type is {:?} but no prefilter child was provided",
+                    prefilter_type
+                ).into(),
+            ));
+        }
+    };
 
     ANNIvfSubIndexExec::try_new(input, dataset, indices, query, prefilter_source)
 }
@@ -244,7 +351,9 @@ mod tests {
             refine_factor: Some(2),
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
+            query_parallelism: -1,
             dist_q_c: 0.42,
+            approx_mode: ApproxMode::Accurate,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -260,7 +369,9 @@ mod tests {
         assert_eq!(query.refine_factor, back.refine_factor);
         assert_eq!(query.metric_type, back.metric_type);
         assert_eq!(query.use_index, back.use_index);
+        assert_eq!(query.query_parallelism, back.query_parallelism);
         assert_eq!(query.dist_q_c, back.dist_q_c);
+        assert_eq!(query.approx_mode, back.approx_mode);
         assert_eq!(query.key.len(), back.key.len());
         assert_eq!(query.key.data_type(), back.key.data_type());
     }
@@ -280,13 +391,21 @@ mod tests {
             refine_factor: None,
             metric_type: None,
             use_index: false,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
 
         let proto = query_to_proto(&query).unwrap();
         let back = query_from_proto(proto).unwrap();
         assert!(back.metric_type.is_none());
         assert!(!back.use_index);
+        assert_eq!(back.approx_mode, ApproxMode::Normal);
+
+        let mut proto = query_to_proto(&query).unwrap();
+        proto.approx_mode = i32::MAX;
+        let back = query_from_proto(proto).unwrap();
+        assert_eq!(back.approx_mode, ApproxMode::Normal);
     }
 
     async fn make_vector_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
@@ -331,6 +450,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ann_ivf_partition_proto_roundtrip() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(!indices.is_empty());
+
+        let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
+        let query = Query {
+            column: "vector".to_string(),
+            key,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 2,
+            maximum_nprobes: Some(4),
+            ef: None,
+            refine_factor: Some(2),
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
+        };
+
+        let exec = ANNIvfPartitionExec::try_new(
+            dataset.clone(),
+            indices.iter().map(|idx| idx.uuid).collect(),
+            query,
+        )
+        .unwrap();
+
+        let proto = ann_ivf_partition_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(proto.index_uuids.len(), indices.len());
+
+        let back = ann_ivf_partition_exec_from_proto(proto, Some(dataset.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(back.query.column, "vector");
+        assert_eq!(back.query.k, 10);
+        assert_eq!(back.query.minimum_nprobes, 2);
+        assert_eq!(back.query.refine_factor, Some(2));
+        assert_eq!(back.index_uuids.len(), indices.len());
+        assert_eq!(back.dataset.uri(), dataset.uri());
+    }
+
+    #[tokio::test]
     async fn test_ann_ivf_sub_index_proto_roundtrip() {
         let (dataset, _dir) = make_indexed_dataset().await;
 
@@ -351,7 +517,9 @@ mod tests {
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
             use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
 
         // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
@@ -377,14 +545,9 @@ mod tests {
         assert_eq!(proto.indices.len(), indices.len());
 
         // Decode
-        let back = ann_ivf_sub_index_exec_from_proto(
-            proto,
-            Some(dataset.clone()),
-            input,
-            PreFilterSource::None,
-        )
-        .await
-        .unwrap();
+        let back = ann_ivf_sub_index_exec_from_proto(proto, Some(dataset.clone()), input, None)
+            .await
+            .unwrap();
 
         assert_eq!(back.query().column, "vector");
         assert_eq!(back.query().k, 10);
@@ -397,5 +560,186 @@ mod tests {
             assert_eq!(original.dataset_version, decoded.dataset_version);
             assert_eq!(original.fields, decoded.fields);
         }
+    }
+
+    /// Helper: build an ANNIvfSubIndexExec with a given prefilter source.
+    async fn build_sub_index_exec(
+        dataset: &Arc<Dataset>,
+        prefilter: PreFilterSource,
+    ) -> ANNIvfSubIndexExec {
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
+        let query = Query {
+            column: "vector".to_string(),
+            key,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 2,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
+        };
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+        ANNIvfSubIndexExec::try_new(input, dataset.clone(), indices, query, prefilter).unwrap()
+    }
+
+    /// Helper: a dummy execution plan to use as a prefilter child.
+    fn make_dummy_prefilter_plan(
+        schema: arrow_schema::SchemaRef,
+    ) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+        TestMemoryExec::try_new_exec(&[], schema, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sub_index_proto_roundtrip_filtered_row_ids() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+        let row_id_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "row_id",
+            arrow_schema::DataType::UInt64,
+            false,
+        )]));
+        let prefilter_plan = make_dummy_prefilter_plan(row_id_schema.clone());
+        let exec = build_sub_index_exec(
+            &dataset,
+            PreFilterSource::FilteredRowIds(prefilter_plan.clone()),
+        )
+        .await;
+
+        let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(
+            proto.prefilter_type,
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::FilteredRowIds as i32
+        );
+
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+        let back = ann_ivf_sub_index_exec_from_proto(
+            proto,
+            Some(dataset.clone()),
+            input,
+            Some(make_dummy_prefilter_plan(row_id_schema)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            back.prefilter_source(),
+            PreFilterSource::FilteredRowIds(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sub_index_proto_roundtrip_scalar_index_query() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+        let scalar_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "result",
+            arrow_schema::DataType::Binary,
+            true,
+        )]));
+        let prefilter_plan = make_dummy_prefilter_plan(scalar_schema.clone());
+        let exec = build_sub_index_exec(
+            &dataset,
+            PreFilterSource::ScalarIndexQuery(prefilter_plan.clone()),
+        )
+        .await;
+
+        let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(
+            proto.prefilter_type,
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::ScalarIndexQuery as i32
+        );
+
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+        let back = ann_ivf_sub_index_exec_from_proto(
+            proto,
+            Some(dataset.clone()),
+            input,
+            Some(make_dummy_prefilter_plan(scalar_schema)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            back.prefilter_source(),
+            PreFilterSource::ScalarIndexQuery(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sub_index_proto_error_type_none_but_child_provided() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+        let exec = build_sub_index_exec(&dataset, PreFilterSource::None).await;
+
+        let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(
+            proto.prefilter_type,
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::None as i32
+        );
+
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+        let dummy = make_dummy_prefilter_plan(Arc::new(arrow_schema::Schema::empty()));
+        let result =
+            ann_ivf_sub_index_exec_from_proto(proto, Some(dataset.clone()), input, Some(dummy))
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sub_index_proto_error_type_set_but_no_child() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+        let scalar_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "result",
+            arrow_schema::DataType::Binary,
+            true,
+        )]));
+        let exec = build_sub_index_exec(
+            &dataset,
+            PreFilterSource::ScalarIndexQuery(make_dummy_prefilter_plan(scalar_schema)),
+        )
+        .await;
+
+        let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(
+            proto.prefilter_type,
+            pb::ann_ivf_sub_index_exec_proto::PreFilterType::ScalarIndexQuery as i32
+        );
+
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+        let result =
+            ann_ivf_sub_index_exec_from_proto(proto, Some(dataset.clone()), input, None).await;
+        assert!(result.is_err());
     }
 }

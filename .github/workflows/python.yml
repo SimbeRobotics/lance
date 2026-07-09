@@ -87,8 +87,8 @@ jobs:
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          pip install maturin
-          maturin develop --profile ci --locked --extras tests,ray
+          pip install maturin==1.13.3 uv
+          maturin develop --uv --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate
@@ -97,7 +97,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["9", "13"]
+        python-minor-version: ["10", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04-4x"
     defaults:

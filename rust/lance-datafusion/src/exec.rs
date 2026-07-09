@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
+    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,7 +15,6 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -28,6 +28,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec,
+        coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
@@ -35,6 +36,7 @@ use datafusion::{
         streaming::PartitionStream,
     },
 };
+use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -71,7 +73,7 @@ pub struct OneShotExec {
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhausted
     schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl OneShotExec {
@@ -81,12 +83,12 @@ impl OneShotExec {
         Self {
             stream: Mutex::new(Some(stream)),
             schema: schema.clone(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::RoundRobinBatch(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 
@@ -195,18 +197,14 @@ impl ExecutionPlan for OneShotExec {
         }
     }
 
-    fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
-    }
-
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 }
 
 struct TracedExec {
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     span: Span,
 }
 
@@ -250,7 +248,7 @@ impl ExecutionPlan for TracedExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -313,7 +311,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -369,12 +367,21 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(options.mem_pool_size() as usize),
+                NonZero::try_from(16).unwrap(),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
@@ -543,18 +550,20 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
     collect_execution_metrics(plan, &mut counts);
-    tracing::info!(
-        target: TRACE_EXECUTION,
-        r#type = EXECUTION_PLAN_RUN,
-        plan_summary = display_plan_one_liner(plan),
-        output_rows,
-        iops = counts.iops,
-        requests = counts.requests,
-        bytes_read = counts.bytes_read,
-        indices_loaded = counts.indices_loaded,
-        parts_loaded = counts.parts_loaded,
-        index_comparisons = counts.index_comparisons,
-    );
+    if !options.skip_logging {
+        tracing::info!(
+            target: TRACE_EXECUTION,
+            r#type = EXECUTION_PLAN_RUN,
+            plan_summary = display_plan_one_liner(plan),
+            output_rows,
+            iops = counts.iops,
+            requests = counts.requests,
+            bytes_read = counts.bytes_read,
+            indices_loaded = counts.indices_loaded,
+            parts_loaded = counts.parts_loaded,
+            index_comparisons = counts.index_comparisons,
+        );
+    }
     if let Some(callback) = options.execution_stats_callback.as_ref() {
         callback(&counts);
     }
@@ -608,14 +617,20 @@ pub fn execute_plan(
 
     let session_ctx = get_session_context(&options);
 
-    // NOTE: we are only executing the first partition here. Therefore, if
-    // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    // Coalesce to a single partition if the optimizer left more than one.
+    // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
+    // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
+        plan
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    };
+
     let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        if !options.skip_logging {
+        if !options.skip_logging || options.execution_stats_callback.is_some() {
             report_plan_summary_metrics(plan.as_ref(), &options);
         }
     });
@@ -893,7 +908,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -999,7 +1014,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 

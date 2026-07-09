@@ -6,6 +6,46 @@ stable and breaking changes should generally be communicated (via warnings) for 
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
 
+## 9.0.0
+
+* Newly created FTS / inverted indexes now default to format v2 instead of v1.
+  The `LANCE_FTS_FORMAT_VERSION` environment variable no longer controls the
+  format used for newly created indexes. Users who need a specific index layout
+  should pass the index creation parameter `format_version` explicitly.
+
+* This affects users who create FTS / inverted indexes and need those indexes to
+  be readable by older Lance versions, or who depend on the v1 index layout. In
+  those cases, pass `format_version=1` when creating the index. Otherwise, newly
+  created indexes will use v2 by default, and older Lance readers may not be able
+  to read them.
+
+  ```python
+  dataset.create_scalar_index("text", "INVERTED", format_version=1)
+  ```
+
+* Existing v1 FTS indexes remain queryable. Operations that maintain an existing
+  v1 index, including append, incremental indexing, optimize, and mem-wal
+  maintained-index flush, should continue preserving the v1 format.
+
+## 7.2.0
+
+* The `IndexSegmentBuilder` API has been removed from Rust, Python, and Java.
+  This API was deprecated by the distributed indexing flow based on
+  `create_index_uncommitted`, `merge_existing_index_segments`, and
+  `commit_existing_index_segments`, but remained in the codebase as a parallel
+  way to plan and publish staged index segments.
+
+* Callers should now publish staged segment outputs directly with
+  `commit_existing_index_segments(...)`. If multiple staged outputs should be
+  combined into a larger physical segment first, callers should explicitly group
+  those outputs and call `merge_existing_index_segments(...)` for each group
+  before committing the final segment list.
+
+* The old builder's `target_segment_bytes` automatic size-based grouping has no
+  direct replacement. Distributed index drivers that used it should choose
+  segment groups themselves, then pass each group to
+  `merge_existing_index_segments(...)`.
+
 ## 5.0.0
 
 * The default data storage version changed from 2.0 to 2.1. This affects the `column_indices`

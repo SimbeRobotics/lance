@@ -22,7 +22,10 @@ use roaring::RoaringTreemap;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
-use crate::dataset::write::merge_insert::{MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats};
+use crate::dataset::write::merge_insert::{
+    MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, SourceDedupeBehavior,
+    create_duplicate_row_error, resolve_target_bases,
+};
 
 use super::{MergeInsertMetrics, apply_deletions};
 
@@ -41,7 +44,7 @@ pub struct DeleteOnlyMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
@@ -55,12 +58,12 @@ impl DeleteOnlyMergeInsertExec {
         params: MergeInsertParams,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             input,
@@ -101,6 +104,8 @@ impl DeleteOnlyMergeInsertExec {
     async fn collect_deletions(
         mut input_stream: SendableRecordBatchStream,
         metrics: MergeInsertMetrics,
+        source_dedupe_behavior: SourceDedupeBehavior,
+        on_columns: &[String],
     ) -> DFResult<RoaringTreemap> {
         let schema = input_stream.schema();
 
@@ -156,8 +161,25 @@ impl DeleteOnlyMergeInsertExec {
 
                 if action == Action::Delete && !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
-                    delete_row_addrs.insert(row_addr);
-                    metrics.num_deleted_rows.add(1);
+                    // The treemap dedupes addresses, so a repeat insert signals
+                    // a duplicate source row matching the same target; apply the
+                    // same dedupe policy as updates. (Delete-only never carries
+                    // `delete_not_matched_by_source`, so every delete here is a
+                    // source match.)
+                    if delete_row_addrs.insert(row_addr) {
+                        metrics.num_deleted_rows.add(1);
+                    } else {
+                        match source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    &batch, row_idx, on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                metrics.num_skipped_duplicates.add(1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -231,7 +253,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -257,13 +279,24 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let input_stream = self.input.execute(partition, context)?;
 
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
         let merged_generations = self.params.merged_generations.clone();
+        let source_dedupe_behavior = self.params.source_dedupe_behavior;
+        let on_columns = self.params.on.clone();
 
         let result_stream = futures::stream::once(async move {
-            let delete_row_addrs = Self::collect_deletions(input_stream, metrics).await?;
+            // Delete-only merges write no data files, but still validate any
+            // requested target bases so unknown bases fail on every path.
+            resolve_target_bases(&dataset, &params).await?;
+            // `metrics` is moved into `collect_deletions`; keep a handle on the
+            // skipped-duplicate counter so it can be folded into the stats below.
+            let skipped_duplicates = metrics.num_skipped_duplicates.clone();
+            let delete_row_addrs =
+                Self::collect_deletions(input_stream, metrics, source_dedupe_behavior, &on_columns)
+                    .await?;
 
             let (updated_fragments, removed_fragment_ids) =
                 apply_deletions(&dataset, &delete_row_addrs)
@@ -284,6 +317,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                     .collect(),
                 update_mode: None,
                 inserted_rows_filter: None, // Delete-only operations don't insert rows
+                updated_fragment_offsets: None,
             };
 
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
@@ -296,7 +330,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 bytes_written: 0,
                 num_files_written: 0,
                 num_attempts: 1,
-                num_skipped_duplicates: 0,
+                num_skipped_duplicates: skipped_duplicates.value() as u64,
             };
 
             if let Ok(mut transaction_guard) = transaction_holder.lock() {

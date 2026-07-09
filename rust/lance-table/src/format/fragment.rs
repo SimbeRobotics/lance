@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::Error;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
 use lance_io::utils::CachedFileSize;
@@ -187,7 +187,7 @@ impl DataFile {
         if self.is_legacy_file() {
             if !self.fields.windows(2).all(|w| w[0] < w[1]) {
                 return Err(Error::corrupt_file(
-                    base_path.child(self.path.clone()),
+                    base_path.clone().join(self.path.clone()),
                     "contained unsorted or duplicate field ids",
                 ));
             }
@@ -195,7 +195,7 @@ impl DataFile {
             // Every recorded field id must have a column index, but not every column needs
             // to be associated with a field id (extra columns are allowed).
             return Err(Error::corrupt_file(
-                base_path.child(self.path.clone()),
+                base_path.clone().join(self.path.clone()),
                 "contained fewer column_indices than fields",
             ));
         }

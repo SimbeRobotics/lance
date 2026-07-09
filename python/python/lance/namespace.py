@@ -20,14 +20,20 @@ from lance_namespace import (
     AlterTableAddColumnsResponse,
     AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse,
+    AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse,
     AlterTableDropColumnsRequest,
     AlterTableDropColumnsResponse,
     AlterTransactionRequest,
     AlterTransactionResponse,
     AnalyzeTableQueryPlanRequest,
     CountTableRowsRequest,
+    CreateMaterializedViewRequest,
+    CreateMaterializedViewResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableBranchRequest,
+    CreateTableBranchResponse,
     CreateTableIndexRequest,
     CreateTableIndexResponse,
     CreateTableRequest,
@@ -38,6 +44,8 @@ from lance_namespace import (
     DeclareTableResponse,
     DeleteFromTableRequest,
     DeleteFromTableResponse,
+    DeleteTableBranchRequest,
+    DeleteTableBranchResponse,
     DeleteTableTagRequest,
     DeleteTableTagResponse,
     DeregisterTableRequest,
@@ -66,6 +74,8 @@ from lance_namespace import (
     LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableBranchesRequest,
+    ListTableBranchesResponse,
     ListTableIndicesRequest,
     ListTableIndicesResponse,
     ListTablesRequest,
@@ -77,6 +87,8 @@ from lance_namespace import (
     MergeInsertIntoTableRequest,
     MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
+    RefreshMaterializedViewRequest,
+    RefreshMaterializedViewResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     RenameTableRequest,
@@ -330,12 +342,13 @@ class DirectoryNamespace(LanceNamespace):
     >>>
     >>> # With AWS credential vending (requires credential-vendor-aws feature)
     >>> # Use **dict to pass property names with dots
-    >>> ns = lance.namespace.DirectoryNamespace(**{
+    >>> aws_properties = {
     ...     "root": "s3://my-bucket/data",
     ...     "credential_vendor.enabled": "true",
     ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
     ...     "credential_vendor.aws_duration_millis": "3600000",
-    ... })
+    ... }
+    >>> # ns = lance.namespace.DirectoryNamespace(**aws_properties)
 
     With dynamic context provider:
 
@@ -788,6 +801,27 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.alter_table_drop_columns(request.model_dump())
         return AlterTableDropColumnsResponse.from_dict(response_dict)
 
+    def alter_table_backfill_columns(
+        self, request: AlterTableBackfillColumnsRequest
+    ) -> AlterTableBackfillColumnsResponse:
+        """Trigger an async backfill job for a computed column."""
+        response_dict = self._inner.alter_table_backfill_columns(request.model_dump())
+        return AlterTableBackfillColumnsResponse.from_dict(response_dict)
+
+    def refresh_materialized_view(
+        self, request: RefreshMaterializedViewRequest
+    ) -> RefreshMaterializedViewResponse:
+        """Trigger an async materialized view refresh."""
+        response_dict = self._inner.refresh_materialized_view(request.model_dump())
+        return RefreshMaterializedViewResponse.from_dict(response_dict)
+
+    def create_materialized_view(
+        self, request: CreateMaterializedViewRequest
+    ) -> CreateMaterializedViewResponse:
+        """Create a materialized view backed by an optional UDTF/chunker."""
+        response_dict = self._inner.create_materialized_view(request.model_dump())
+        return CreateMaterializedViewResponse.from_dict(response_dict)
+
     # Table tag operations
 
     def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
@@ -822,6 +856,27 @@ class DirectoryNamespace(LanceNamespace):
         """Update a tag to point to a different version."""
         response_dict = self._inner.update_table_tag(request.model_dump())
         return UpdateTableTagResponse.from_dict(response_dict)
+
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        """Create a new branch forked from a table version."""
+        response_dict = self._inner.create_table_branch(request.model_dump())
+        return CreateTableBranchResponse.from_dict(response_dict)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        """List all branches of a table."""
+        response_dict = self._inner.list_table_branches(request.model_dump())
+        return ListTableBranchesResponse.from_dict(response_dict)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        """Delete a branch from a table."""
+        response_dict = self._inner.delete_table_branch(request.model_dump())
+        return DeleteTableBranchResponse.from_dict(response_dict)
 
     # Operation metrics methods
 
@@ -1337,6 +1392,27 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.alter_table_drop_columns(request.model_dump())
         return AlterTableDropColumnsResponse.from_dict(response_dict)
 
+    def alter_table_backfill_columns(
+        self, request: AlterTableBackfillColumnsRequest
+    ) -> AlterTableBackfillColumnsResponse:
+        """Trigger an async backfill job for a computed column."""
+        response_dict = self._inner.alter_table_backfill_columns(request.model_dump())
+        return AlterTableBackfillColumnsResponse.from_dict(response_dict)
+
+    def refresh_materialized_view(
+        self, request: RefreshMaterializedViewRequest
+    ) -> RefreshMaterializedViewResponse:
+        """Trigger an async materialized view refresh."""
+        response_dict = self._inner.refresh_materialized_view(request.model_dump())
+        return RefreshMaterializedViewResponse.from_dict(response_dict)
+
+    def create_materialized_view(
+        self, request: CreateMaterializedViewRequest
+    ) -> CreateMaterializedViewResponse:
+        """Create a materialized view backed by an optional UDTF/chunker."""
+        response_dict = self._inner.create_materialized_view(request.model_dump())
+        return CreateMaterializedViewResponse.from_dict(response_dict)
+
     # Table tag operations
 
     def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
@@ -1371,6 +1447,27 @@ class RestNamespace(LanceNamespace):
         """Update a tag to point to a different version."""
         response_dict = self._inner.update_table_tag(request.model_dump())
         return UpdateTableTagResponse.from_dict(response_dict)
+
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        """Create a new branch forked from a table version."""
+        response_dict = self._inner.create_table_branch(request.model_dump())
+        return CreateTableBranchResponse.from_dict(response_dict)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        """List all branches of a table."""
+        response_dict = self._inner.list_table_branches(request.model_dump())
+        return ListTableBranchesResponse.from_dict(response_dict)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        """Delete a branch from a table."""
+        response_dict = self._inner.delete_table_branch(request.model_dump())
+        return DeleteTableBranchResponse.from_dict(response_dict)
 
     # Operation metrics methods
 

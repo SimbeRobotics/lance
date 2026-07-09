@@ -9,9 +9,9 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use deepsize::DeepSizeOf;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
@@ -110,6 +110,29 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
     }
 }
 
+/// Reject `FixedSizeList` types whose dimension is not a positive integer.
+///
+/// The row count of a fixed-size list is derived by dividing the number of
+/// child items by the dimension, so a zero dimension panics with a
+/// divide-by-zero further down the write path (see issue #5102). A
+/// `FixedSizeList` of a `FixedSizeList` over a primitive collapses into a
+/// single leaf field, so the pre-order field walk never visits the inner list;
+/// recurse through the nested list types here to catch an inner zero dimension.
+///
+/// Shared by [`Schema::validate`] on the write path and the decoder's
+/// field-scheduler builders on the read path.
+pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataType) -> Result<()> {
+    if let DataType::FixedSizeList(inner, dimension) = data_type {
+        if *dimension <= 0 {
+            return Err(Error::schema(format!(
+                "Field \"{field_name}\" contains a FixedSizeList with dimension {dimension}; dimension must be a positive integer"
+            )));
+        }
+        validate_fixed_size_list_dimensions(field_name, inner.data_type())?;
+    }
+    Ok(())
+}
+
 impl Schema {
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
@@ -132,6 +155,20 @@ impl Schema {
         });
 
         pk_fields
+    }
+
+    /// The unenforced clustering key fields in the schema, ordered by position.
+    ///
+    /// Fields are ordered by their explicit position value (1-based).
+    pub fn unenforced_clustering_key(&self) -> Vec<&Field> {
+        let mut ck_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_clustering_key())
+            .collect();
+
+        ck_fields.sort_by_key(|f| f.unenforced_clustering_key_position.unwrap_or(0));
+
+        ck_fields
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
@@ -332,6 +369,10 @@ impl Schema {
                     field.id, self
                 )));
             }
+            // The row count of a fixed-size list is derived by dividing the
+            // number of items by the dimension, so a zero dimension would
+            // panic with a divide-by-zero further down the write path.
+            validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
         Ok(())
@@ -717,10 +758,6 @@ impl Schema {
             metadata,
         };
         Ok(schema)
-    }
-
-    pub fn all_fields_nullable(&self) -> bool {
-        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
     }
 
     /// Returns the properly formatted path from root to the field.
@@ -2434,86 +2471,6 @@ mod tests {
     }
 
     #[test]
-    pub fn test_all_fields_nullable() {
-        let test_cases = vec![
-            (
-                vec![], // empty schema
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, true).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ], // basic case
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, false).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, parent is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            false,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, child is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        false,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, all is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                true,
-            ),
-        ];
-
-        for (fields, expected) in test_cases {
-            let schema = Schema {
-                fields,
-                metadata: Default::default(),
-            };
-            assert_eq!(schema.all_fields_nullable(), expected);
-        }
-    }
-
-    #[test]
     fn test_schema_unenforced_primary_key() {
         let cases = vec![
             ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]),
@@ -2809,5 +2766,150 @@ mod tests {
         assert!(paths.contains(&"id".to_string()));
         assert!(paths.contains(&"vector".to_string()));
         assert!(paths.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_dimension_fixed_size_list() {
+        // A zero dimension divides-by-zero further down the write path (#5102)
+        let fsl = |dimension: i32| {
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", ArrowDataType::Float32, true)),
+                dimension,
+            )
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(0), true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Nested inside a struct is rejected too
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "vec",
+                fsl(0),
+                true,
+            )])),
+            true,
+        )]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A zero-dimension FixedSizeList nested inside a positive-dimension
+        // FixedSizeList collapses into a single leaf field, so the inner
+        // dimension is not visited by the pre-order field walk and must still
+        // be rejected: FixedSizeList(FixedSizeList(Float32, 0), 4).
+        let nested =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(0), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested, true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A positive dimension still validates, including nested lists
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(2), true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
+        let nested_ok =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(2), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested_ok, true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
+    }
+
+    #[test]
+    fn test_schema_unenforced_clustering_key() {
+        use crate::datatypes::field::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        // No clustering key fields
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert!(schema.unenforced_clustering_key().is_empty());
+
+        // Single clustering key field
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let ck = schema.unenforced_clustering_key();
+        assert_eq!(ck.len(), 1);
+        assert_eq!(ck[0].name, "a");
+
+        // Clustering key fields can be nullable (unlike primary keys)
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(schema.unenforced_clustering_key().len(), 1);
+    }
+
+    #[test]
+    fn test_schema_unenforced_clustering_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        // Fields ordered by position regardless of schema column order
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Utf8, true).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "3".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "2".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Float64, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let ck = schema.unenforced_clustering_key();
+        assert_eq!(ck.len(), 3);
+        assert_eq!(ck[0].name, "a");
+        assert_eq!(ck[1].name, "b");
+        assert_eq!(ck[2].name, "c");
     }
 }

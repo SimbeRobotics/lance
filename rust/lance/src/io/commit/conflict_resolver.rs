@@ -7,16 +7,13 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction},
+    dataset::transaction::{Operation, Transaction, UpdateMode},
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, Result,
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
-};
+use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use std::{
@@ -179,6 +176,22 @@ impl<'a> TransactionRebase<'a> {
             format!(
                 "This {} transaction is incompatible with concurrent transaction {} at version {}.",
                 self.transaction.operation, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
+    #[track_caller]
+    fn data_replacement_target_removed_err(
+        &self,
+        fragment_id: u64,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "DataReplacement target fragment {} was removed by concurrent {} at version {}.",
+                fragment_id, other_transaction.operation, other_version
             )
             .into(),
         )
@@ -746,9 +759,38 @@ impl<'a> TransactionRebase<'a> {
                                 .push(committed_fri.clone());
                             Ok(())
                         }
-                        // If rewrite defers index remap,
-                        // then it does not conflict with index creation
-                        (None, Some(_)) => Ok(()),
+                        // If rewrite defers index remap, the FRI handles the
+                        // post-commit bitmap update — but only if each rewrite
+                        // group is fully inside or fully outside each new
+                        // index's fragment bitmap. A group that straddles
+                        // would produce a bitmap with a mix of indexed and
+                        // non-indexed fragments, which load_indices rejects.
+                        (None, Some(_)) => {
+                            for index in new_indices {
+                                let Some(frag_bitmap) = &index.fragment_bitmap else {
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
+                                };
+                                for group in groups {
+                                    let mut indexed = 0usize;
+                                    let mut unindexed = 0usize;
+                                    for frag in &group.old_fragments {
+                                        if frag_bitmap.contains(frag.id as u32) {
+                                            indexed += 1;
+                                        } else {
+                                            unindexed += 1;
+                                        }
+                                    }
+                                    if indexed > 0 && unindexed > 0 {
+                                        return Err(self.retryable_conflict_err(
+                                            other_transaction,
+                                            other_version,
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), None) => {
                             // this should not happen today since we don't support committing
@@ -878,13 +920,72 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
-                | Operation::Delete { .. }
-                | Operation::Update { .. }
-                | Operation::Merge { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Merge { .. } => {
+                    // Merge rewrites the whole fragment list; always conflict
+                    // (symmetric with check_merge_txn).
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                Operation::Delete {
+                    deleted_fragment_ids,
+                    ..
+                } => {
+                    // A delete only tombstones rows (deletion vector); our positional
+                    // file stays aligned and the rebase preserves the deletion vector.
+                    // Conflict only if our target fragment was removed outright.
+                    for replacement in replacements {
+                        if deleted_fragment_ids.contains(&replacement.0) {
+                            return Err(self.data_replacement_target_removed_err(
+                                replacement.0,
+                                other_transaction,
+                                other_version,
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+                Operation::Update {
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                    update_mode,
+                    ..
+                } => {
+                    for replacement in replacements {
+                        if removed_fragment_ids.contains(&replacement.0) {
+                            return Err(self.data_replacement_target_removed_err(
+                                replacement.0,
+                                other_transaction,
+                                other_version,
+                            ));
+                        }
+                        if !updated_fragments.iter().any(|f| f.id == replacement.0) {
+                            continue;
+                        }
+                        // A row-rewriting update moves the matched rows out to
+                        // new_fragments our positional file does not cover; a horizontal
+                        // update may rewrite one of our fields in place. Either makes the
+                        // file stale. (RewriteColumns new_fragments are unrelated inserts,
+                        // not moved rows, so they stay aligned.)
+                        let moved_rows = !new_fragments.is_empty()
+                            && matches!(update_mode, Some(UpdateMode::RewriteRows) | None);
+                        let field_rewritten = replacement
+                            .1
+                            .fields
+                            .iter()
+                            .any(|f| *f >= 0 && fields_modified.contains(&(*f as u32)));
+                        if moved_rows || field_rewritten {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::CreateIndex { new_indices, .. } => {
                     // A data replacement only conflicts if it is updating the field that
                     // is being indexed.
@@ -1335,7 +1436,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.object_store().io_parallelism())
+                    .buffered(dataset.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -1391,7 +1492,7 @@ impl<'a> TransactionRebase<'a> {
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store(),
+                        dataset.object_store.as_ref(),
                     )
                     .await?;
 
@@ -1681,6 +1782,7 @@ fn wrong_operation_err(op: &Operation) -> Error {
 mod tests {
     use std::{num::NonZero, sync::Arc};
 
+    use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
@@ -1786,6 +1888,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1798,6 +1901,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1813,6 +1917,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1820,12 +1925,12 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 0);
             assert_io_eq!(io_stats, write_iops, 0);
         }
@@ -1839,7 +1944,7 @@ mod tests {
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction, expected_transaction);
         // We didn't need to do any IO, so the stats should be 0.
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
     }
@@ -1855,7 +1960,7 @@ mod tests {
                 deletion_file,
                 // Reference deletion file should never enter this apply_deletion. So base path is fine.
                 &dataset.base,
-                dataset.object_store(),
+                dataset.object_store.as_ref(),
             )
             .await
             .unwrap()
@@ -1870,7 +1975,7 @@ mod tests {
             fragment.id,
             dataset.manifest.version,
             &current_deletions,
-            dataset.object_store(),
+            dataset.object_store.as_ref(),
         )
         .await
         .unwrap();
@@ -1915,6 +2020,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1930,6 +2036,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let transactions =
@@ -1944,12 +2051,12 @@ mod tests {
                     .await
                     .unwrap();
 
-            dataset.object_store().io_stats_incremental(); // reset
+            dataset.object_store.as_ref().io_stats_incremental(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
                     .check_txn(other_transaction, other_version as u64)
                     .unwrap();
-                let io_stats = dataset.object_store().io_stats_incremental();
+                let io_stats = dataset.object_store.as_ref().io_stats_incremental();
                 assert_io_eq!(io_stats, read_iops, 0);
                 assert_io_eq!(io_stats, write_iops, 0);
             }
@@ -1960,7 +2067,7 @@ mod tests {
             let rebased_transaction = rebase.finish(&dataset).await.unwrap();
             assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
 
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             if expected_rewrite {
                 // Read the current deletion file, and write the new one.
                 assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
@@ -1985,7 +2092,7 @@ mod tests {
                 //     original_fragment.id,
                 //     original_fragment.deletion_file.as_ref().unwrap(),
                 // );
-                // assert!(!dataset.object_store().exists(&old_path).await.unwrap());
+                // assert!(!dataset.object_store.as_ref().exists(&old_path).await.unwrap());
                 // The new deletion file should exist.
                 let final_fragment = match &rebased_transaction.operation {
                     Operation::Update {
@@ -2003,7 +2110,14 @@ mod tests {
                     final_fragment.id,
                     final_fragment.deletion_file.as_ref().unwrap(),
                 );
-                assert!(dataset.object_store().exists(&new_path).await.unwrap());
+                assert!(
+                    dataset
+                        .object_store
+                        .as_ref()
+                        .exists(&new_path)
+                        .await
+                        .unwrap()
+                );
 
                 assert_io_eq!(io_stats, num_stages, 1);
             } else {
@@ -2052,6 +2166,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2065,6 +2180,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2109,12 +2225,12 @@ mod tests {
 
         let affected_rows = RowAddrTreeMap::from_iter([0]);
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2139,7 +2255,7 @@ mod tests {
             vec![(0, true)],
         );
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2149,7 +2265,7 @@ mod tests {
             Err(crate::Error::RetryableCommitConflict { .. })
         ));
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
         assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
     }
@@ -2225,6 +2341,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             create_update_config_for_test(
                 Some(HashMap::from_iter(vec![(
@@ -2431,6 +2548,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
                 [
                     Compatible,    // append
@@ -2953,6 +3071,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
 
@@ -3215,7 +3334,7 @@ mod tests {
             (
                 "DataReplacement vs Rewrite on different fragment",
                 Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -3226,6 +3345,154 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 Compatible,
+            ),
+            // A concurrent Update/Delete only invalidates our positional file when it
+            // removes our target fragment outright, or (a horizontal update) rewrites
+            // one of our fields. A deletion-vector-only change stays aligned.
+            (
+                "DataReplacement vs Update (RewriteColumns) on a different field",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![2],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Compatible,
+            ),
+            (
+                // RewriteColumns new_fragments are unrelated inserts, not moved rows.
+                "DataReplacement vs Update (RewriteColumns) with inserts on a different field",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![Fragment::new(5)],
+                    fields_modified: vec![2],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Compatible,
+            ),
+            (
+                "DataReplacement vs Update (RewriteColumns) that rewrote one of our fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![1],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "DataReplacement vs Update (RewriteRows) that moved our rows",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![Fragment::new(5)],
+                    fields_modified: vec![],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteRows),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "DataReplacement vs Update that removed our fragment",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![],
+                    removed_fragment_ids: vec![0],
+                    new_fragments: vec![],
+                    fields_modified: vec![],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                NotCompatible,
+            ),
+            (
+                "DataReplacement vs Update (RewriteRows) that moved a different fragment's rows",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(1)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![Fragment::new(5)],
+                    fields_modified: vec![],
+                    merged_generations: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteRows),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Compatible,
+            ),
+            (
+                "DataReplacement vs Delete (deletion-vector only) on same fragment",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Delete {
+                    deleted_fragment_ids: vec![],
+                    updated_fragments: vec![Fragment::new(0)],
+                    predicate: "a > 0".to_string(),
+                },
+                Compatible,
+            ),
+            (
+                "DataReplacement vs Delete that removes the fragment",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                },
+                Operation::Delete {
+                    deleted_fragment_ids: vec![0],
+                    updated_fragments: vec![],
+                    predicate: "a > 0".to_string(),
+                },
+                NotCompatible,
+            ),
+            // Merge rewrites the whole fragment list -> always conflicts.
+            (
+                "DataReplacement vs Merge",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                },
+                Operation::Merge {
+                    fragments: vec![Fragment::new(0)],
+                    schema: lance_core::datatypes::Schema::default(),
+                },
+                Retryable,
             ),
         ];
 
@@ -3253,8 +3520,10 @@ mod tests {
                     );
                 }
                 NotCompatible => {
+                    // Removal returns a non-retryable IncompatibleTransaction so the
+                    // caller can drop the fragment instead of retrying.
                     assert!(
-                        matches!(result, Err(Error::CommitConflict { .. })),
+                        matches!(result, Err(Error::IncompatibleTransaction { .. })),
                         "{}: expected NotCompatible but got {:?}",
                         description,
                         result

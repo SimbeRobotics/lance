@@ -7,8 +7,8 @@
 //!
 
 use arrow_schema::{DataType, Field};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
@@ -17,9 +17,11 @@ use super::storage::VectorStore;
 
 pub mod builder;
 pub mod index;
+pub mod online;
 
 pub use builder::HNSW;
 pub use index::HNSWIndex;
+pub use online::OnlineHnswBuilder;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -59,7 +61,7 @@ impl Default for HnswMetadata {
 ///
 /// # NOTE
 /// The results are not ordered.
-fn select_neighbors_heuristic(
+pub(crate) fn select_neighbors_heuristic(
     storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,
@@ -67,7 +69,19 @@ fn select_neighbors_heuristic(
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec();
     }
-    let mut candidates = candidates.to_vec();
+
+    select_neighbors_heuristic_owned(storage, candidates.to_vec(), k)
+}
+
+pub(crate) fn select_neighbors_heuristic_owned(
+    storage: &impl VectorStore,
+    mut candidates: Vec<OrderedNode>,
+    k: usize,
+) -> Vec<OrderedNode> {
+    if candidates.len() <= k {
+        return candidates;
+    }
+
     candidates.sort_unstable();
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);

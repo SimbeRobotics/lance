@@ -28,8 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 
-use std::ffi::CString;
-
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
@@ -40,7 +38,9 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
-use dataset::cleanup::CleanupStats;
+use dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -53,12 +53,16 @@ use file::{
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
+use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
+use std::ffi::CString;
+use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -68,7 +72,9 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod otel;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -92,6 +98,9 @@ pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
+use crate::blob::{
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+};
 use crate::executor::BackgroundExecutor;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -253,6 +262,10 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
+    m.add_class::<PyBlobDescriptor>()?;
+    m.add_class::<PyBlobDescriptorArrayBuilder>()?;
+    m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileSession>()?;
@@ -263,6 +276,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<CleanupCandidateFile>()?;
+    m.add_class::<CleanupReferencedBranch>()?;
+    m.add_class::<CleanupExplanation>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
@@ -282,15 +298,33 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestNamespace>()?;
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
+    // MemWAL classes
+    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyShardSnapshot>()?;
+    m.add_class::<mem_wal::PyShardWriter>()?;
+    m.add_class::<mem_wal::PyLsmScanner>()?;
+    m.add_class::<mem_wal::PyExecutionPlan>()?;
+    m.add_class::<mem_wal::PyLsmPointLookupPlanner>()?;
+    m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
+    m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
+    m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
+    m.add_wrapped(wrap_pyfunction!(schema::parse_field_path))?;
+    m.add_wrapped(wrap_pyfunction!(schema::format_field_path))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    // OpenTelemetry metrics bridge
+    m.add_class::<otel::PyMetricPoint>()?;
+    m.add_class::<otel::PyMetricDescription>()?;
+    m.add_wrapped(wrap_pyfunction!(otel::register_lance_metrics_recorder))?;
+    m.add_wrapped(wrap_pyfunction!(otel::lance_metrics_catalog))?;
+    m.add_wrapped(wrap_pyfunction!(otel::snapshot_lance_metrics))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
@@ -368,7 +402,12 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     ))
 }
 
-#[pyclass(name = "FFILanceTableProvider", module = "lance", subclass)]
+#[pyclass(
+    name = "FFILanceTableProvider",
+    module = "lance",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct FFILanceTableProvider {
     dataset: Arc<::lance::Dataset>,
@@ -424,8 +463,11 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
         obj
     };
 
-    let capsule = capsule.downcast::<PyCapsule>()?;
-    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+    let capsule = capsule.cast::<PyCapsule>()?;
+    let data: NonNull<FFI_LogicalExtensionCodec> = capsule
+        .pointer_checked(Some(c_str!("datafusion_logical_extension_codec")))?
+        .cast();
+    let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
 }

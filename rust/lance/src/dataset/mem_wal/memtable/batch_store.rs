@@ -43,7 +43,9 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -52,6 +54,8 @@ pub struct StoredBatch {
     pub data: RecordBatch,
     /// Number of rows in this batch (cached for quick access).
     pub num_rows: usize,
+    /// Estimated memory size in bytes.
+    pub estimated_size: usize,
     /// Row offset in the MemTable (cumulative rows before this batch).
     pub row_offset: u64,
     /// Position of this batch in the store (0-indexed).
@@ -62,13 +66,82 @@ impl StoredBatch {
     /// Create a new StoredBatch.
     pub fn new(data: RecordBatch, row_offset: u64, batch_position: usize) -> Self {
         let num_rows = data.num_rows();
+        let estimated_size = Self::estimate_batch_size(&data);
         Self {
             data,
             num_rows,
+            estimated_size,
             row_offset,
             batch_position,
         }
     }
+
+    /// Estimate the memory size of a RecordBatch.
+    ///
+    /// Sums each column's slice-aware buffer size (see
+    /// [`Self::estimate_array_size`]) plus the struct overhead, so a column that
+    /// is a zero-copy slice of a larger parent contributes only its own window
+    /// rather than the whole shared buffer.
+    fn estimate_batch_size(batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|col| Self::estimate_array_size(&col.to_data()))
+            .sum::<usize>()
+            + std::mem::size_of::<RecordBatch>()
+    }
+
+    /// Slice-aware buffer size of a single array.
+    ///
+    /// [`ArrayData::get_slice_memory_size`] reports each buffer's own window
+    /// (not the whole shared buffer), but omits the variadic data buffers of
+    /// `Utf8View`/`BinaryView` (values > 12 bytes) while still returning `Ok`, so
+    /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
+    /// zero-copy slices and are counted at full capacity for each slice — an
+    /// over-count in the safe direction.
+    fn estimate_array_size(data: &ArrayData) -> usize {
+        match data.get_slice_memory_size() {
+            Ok(size) => size + Self::view_data_buffers_size(data),
+            // Fall back to the full-buffer sum for layouts the slice-aware call
+            // cannot handle.
+            Err(_) => data.get_array_memory_size(),
+        }
+    }
+
+    /// Capacity of the variadic `Utf8View`/`BinaryView` data buffers that
+    /// [`ArrayData::get_slice_memory_size`] omits, summed recursively over children.
+    fn view_data_buffers_size(data: &ArrayData) -> usize {
+        let mut size = 0;
+        if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            // buffers()[0] is the 16-byte view array that get_slice_memory_size
+            // already counts; [1..] are the data buffers it skips.
+            size += data
+                .buffers()
+                .iter()
+                .skip(1)
+                .map(|b| b.capacity())
+                .sum::<usize>();
+        }
+        for child in data.child_data() {
+            size += Self::view_data_buffers_size(child);
+        }
+        size
+    }
+}
+
+/// Snapshot of the active batches that have not yet been flushed to WAL.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PendingWalFlushStats {
+    /// First pending batch position, inclusive.
+    pub start_batch_position: Option<usize>,
+    /// Last pending batch position, exclusive.
+    pub end_batch_position: Option<usize>,
+    /// Number of pending batches.
+    pub batch_count: usize,
+    /// Number of rows in pending batches.
+    pub row_count: usize,
+    /// Estimated bytes in pending batches.
+    pub estimated_bytes: usize,
 }
 
 /// Error returned when the store is full.
@@ -220,13 +293,12 @@ impl BatchStore {
             return Err(StoreFull);
         }
 
-        let num_rows = batch.num_rows();
-        let estimated_size = Self::estimate_batch_size(&batch);
-
         // Row offset is the total rows BEFORE this batch
         let row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
         let stored = StoredBatch::new(batch, row_offset, idx);
+        let num_rows = stored.num_rows;
+        let estimated_size = stored.estimated_size;
 
         // SAFETY:
         // 1. idx < capacity, so slot exists
@@ -289,10 +361,9 @@ impl BatchStore {
         // Write all batches to slots (not yet visible to readers)
         for (i, batch) in batches.into_iter().enumerate() {
             let idx = start_idx + i;
-            let num_rows = batch.num_rows();
-            let estimated_size = Self::estimate_batch_size(&batch);
-
             let stored = StoredBatch::new(batch, row_offset, idx);
+            let num_rows = stored.num_rows;
+            let estimated_size = stored.estimated_size;
 
             // SAFETY:
             // 1. idx < capacity (checked above)
@@ -322,16 +393,6 @@ impl BatchStore {
             .store(start_idx + count, Ordering::Release);
 
         Ok(results)
-    }
-
-    /// Estimate the memory size of a RecordBatch.
-    fn estimate_batch_size(batch: &RecordBatch) -> usize {
-        batch
-            .columns()
-            .iter()
-            .map(|col| col.get_array_memory_size())
-            .sum::<usize>()
-            + std::mem::size_of::<RecordBatch>()
     }
 
     // =========================================================================
@@ -439,6 +500,29 @@ impl BatchStore {
         } else {
             None
         }
+    }
+
+    /// Get a point-in-time summary of batches pending WAL flush.
+    pub fn pending_wal_flush_stats(&self) -> PendingWalFlushStats {
+        let Some((start, end)) = self.pending_wal_flush_range() else {
+            return PendingWalFlushStats::default();
+        };
+
+        let mut stats = PendingWalFlushStats {
+            start_batch_position: Some(start),
+            end_batch_position: Some(end),
+            batch_count: 0,
+            row_count: 0,
+            estimated_bytes: 0,
+        };
+        for batch_position in start..end {
+            if let Some(stored) = self.get(batch_position) {
+                stats.batch_count += 1;
+                stats.row_count += stored.num_rows;
+                stats.estimated_bytes += stored.estimated_size;
+            }
+        }
+        stats
     }
 
     /// Get a reference to a batch by index.
@@ -573,6 +657,22 @@ impl BatchStore {
         let len = self.committed_len.load(Ordering::Acquire);
         let end = (max_visible_batch_position + 1).min(len);
         (0..end).collect()
+    }
+
+    /// The inclusive maximum visible *row* position at `max_visible_batch_position`,
+    /// or `None` when no rows are visible. The visible batches are the committed
+    /// prefix `[0, last_visible_idx]`; each batch carries its cumulative
+    /// `row_offset`, so this is the end of the last visible batch minus one.
+    /// Used to bound MVCC seeks against the maintained PK-position index.
+    pub fn max_visible_row(&self, max_visible_batch_position: usize) -> Option<u64> {
+        let len = self.committed_len.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        let last_visible_idx = max_visible_batch_position.min(len - 1);
+        let last = self.get(last_visible_idx)?;
+        let visible_end = last.row_offset + last.num_rows as u64; // exclusive
+        visible_end.checked_sub(1)
     }
 
     /// Check if a specific batch is visible at a given visibility position.
@@ -871,6 +971,37 @@ mod tests {
     }
 
     #[test]
+    fn test_max_visible_row() {
+        // (1) Empty store: no rows are visible at any position.
+        let store = BatchStore::with_capacity(10);
+        assert_eq!(store.max_visible_row(0), None);
+        assert_eq!(store.max_visible_row(100), None);
+
+        // Three batches → rows [0,10) [10,30) [30,60); row_offsets 0, 10, 30.
+        store.append(create_test_batch(10)).unwrap(); // position 0
+        store.append(create_test_batch(20)).unwrap(); // position 1
+        store.append(create_test_batch(30)).unwrap(); // position 2
+
+        // (2) A position within range yields the inclusive end of that prefix.
+        assert_eq!(store.max_visible_row(0), Some(9)); // batch 0: 0..10
+        assert_eq!(store.max_visible_row(1), Some(29)); // batch 1: 10..30
+        assert_eq!(store.max_visible_row(2), Some(59)); // batch 2: 30..60
+
+        // (3) A position beyond the committed range clamps to the last batch,
+        // i.e. the inclusive max over all rows.
+        assert_eq!(store.max_visible_row(100), Some(59));
+
+        // (4) An empty leading batch contributes no rows: at its own position
+        // the inclusive end underflows to None, while a later non-empty batch
+        // is reported correctly.
+        let store = BatchStore::with_capacity(10);
+        store.append(create_test_batch(0)).unwrap(); // position 0: rows [0,0)
+        store.append(create_test_batch(5)).unwrap(); // position 1: rows [0,5)
+        assert_eq!(store.max_visible_row(0), None); // empty prefix → no rows
+        assert_eq!(store.max_visible_row(1), Some(4)); // through batch 1
+    }
+
+    #[test]
     fn test_recommended_capacity() {
         // 64MB memtable, 64KB avg batch = 1024 batches * 1.2 = ~1228
         let cap = BatchStore::recommended_capacity(64 * 1024 * 1024);
@@ -883,6 +1014,122 @@ mod tests {
         // Very small memtable should get minimum capacity
         let cap = BatchStore::recommended_capacity(1024);
         assert_eq!(cap, 16); // minimum
+    }
+
+    #[test]
+    fn test_estimated_size_is_slice_aware() {
+        // A batch that is a zero-copy slice of a larger parent must contribute
+        // only its own window to the estimate, not the whole shared buffer.
+        // `get_array_memory_size` counts every buffer's full capacity regardless
+        // of offset/length, so N slices tiling one parent each report the
+        // parent's size and inflate the memtable estimate ~N×, tripping the
+        // flush threshold far below the configured size.
+        let chunk = 1_000;
+        let num_slices = 100;
+        let parent = create_test_batch(chunk * num_slices);
+
+        // One window vs an equivalently-sized owned batch should track each
+        // other; the buggy per-slice estimate would be ~num_slices× larger.
+        let slice_est = StoredBatch::estimate_batch_size(&parent.slice(0, chunk));
+        let owned_est = StoredBatch::estimate_batch_size(&create_test_batch(chunk));
+        assert!(
+            slice_est <= owned_est * 2,
+            "slice estimate {slice_est} should track its own window (~{owned_est}), not the parent"
+        );
+
+        // End-to-end: tiling the parent with zero-copy slices must not multiply
+        // the store's running estimate. Track what the old full-buffer behavior
+        // would have summed to for contrast.
+        let store = BatchStore::with_capacity(num_slices);
+        let mut over_counting_sum = 0usize;
+        for k in 0..num_slices {
+            let s = parent.slice(k * chunk, chunk);
+            over_counting_sum += s
+                .columns()
+                .iter()
+                .map(|col| col.get_array_memory_size())
+                .sum::<usize>()
+                + std::mem::size_of::<RecordBatch>();
+            store.append(s).unwrap();
+        }
+
+        // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
+        let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
+        let estimated = store.estimated_bytes();
+        assert!(
+            estimated >= payload_bytes,
+            "estimate {estimated} should cover the actual payload {payload_bytes}"
+        );
+        // The old behavior over-counts by ~num_slices×; the fix must be far
+        // below it (generous 10× margin against struct/alignment overhead).
+        assert!(
+            estimated * 10 < over_counting_sum,
+            "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_size_counts_view_data_buffers() {
+        // Long Utf8View/BinaryView values live in variadic data buffers that
+        // `get_slice_memory_size` ignores (returning ~16 * rows). The estimate
+        // must include them, both for a top-level view column and for a view
+        // array nested in a container, which is only reached via child_data
+        // recursion.
+        use arrow_array::{Array, ArrayRef, StringViewArray, StructArray};
+
+        let num_rows = 1_000;
+        // Each value exceeds the 12-byte inline limit, so it spills to a data buffer.
+        let long_value = "x".repeat(64);
+        let payload_bytes = num_rows * long_value.len();
+        // What the slice-aware call alone reports: just the 16-byte view entries.
+        let view_entries_only = num_rows * 16;
+
+        let make_views = || {
+            StringViewArray::from(
+                (0..num_rows)
+                    .map(|_| Some(long_value.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let assert_covers = |batch: &RecordBatch| {
+            let estimated = StoredBatch::estimate_batch_size(batch);
+            assert!(
+                estimated >= payload_bytes,
+                "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
+            );
+            assert!(
+                estimated > view_entries_only * 2,
+                "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
+            );
+        };
+
+        // Top-level view column.
+        let flat = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(make_views())],
+        )
+        .unwrap();
+        assert_covers(&flat);
+
+        // View nested inside a struct — reachable only through child_data recursion.
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("s", DataType::Utf8View, false)),
+            Arc::new(make_views()) as ArrayRef,
+        )]);
+        let nested = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "st",
+                nested.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(nested)],
+        )
+        .unwrap();
+        assert_covers(&nested);
     }
 
     #[test]

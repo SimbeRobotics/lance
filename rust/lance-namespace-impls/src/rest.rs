@@ -18,14 +18,17 @@ use crate::context::{DynamicContextProvider, OperationInfo};
 use lance_namespace::apis::urlencode;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
@@ -35,13 +38,15 @@ use lance_namespace::models::{
     ErrorResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -831,6 +836,11 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
+        }
         self.get_json(&path, &query, "list_tables", &id).await
     }
 
@@ -849,6 +859,11 @@ impl LanceNamespace for RestNamespace {
         if let Some(detailed) = request.load_detailed_metadata {
             detailed_str = detailed.to_string();
             query.push(("load_detailed_metadata", detailed_str.as_str()));
+        }
+        let check_declared_str;
+        if let Some(check_declared) = request.check_declared {
+            check_declared_str = check_declared.to_string();
+            query.push(("check_declared", check_declared_str.as_str()));
         }
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
@@ -920,6 +935,32 @@ impl LanceNamespace for RestNamespace {
         if let Some(ref mode) = request.mode {
             mode_str = mode.clone();
             query.push(("mode", mode_str.as_str()));
+        }
+        // The REST spec maps create_table metadata onto query parameters because the request body
+        // is already reserved for the Arrow IPC stream.
+        let properties_str;
+        if let Some(ref properties) = request.properties {
+            properties_str = serde_json::to_string(properties).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table properties as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("properties", properties_str.as_str()));
+        }
+        let storage_options_str;
+        if let Some(ref storage_options) = request.storage_options {
+            storage_options_str = serde_json::to_string(storage_options).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table storage_options as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("storage_options", storage_options_str.as_str()));
         }
         self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
             .await
@@ -1204,6 +1245,11 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
+        }
         self.get_json(path, &query, "list_all_tables", "").await
     }
 
@@ -1250,6 +1296,13 @@ impl LanceNamespace for RestNamespace {
         if let Some(descending) = request.descending {
             descending_str = descending.to_string();
             query.push(("descending", descending_str.as_str()));
+        }
+        // Forward branch as a query param (this op sends no body).
+        // describe_table_version differs: branch rides its body, already serialized.
+        let branch_str;
+        if let Some(ref branch) = request.branch {
+            branch_str = branch.clone();
+            query.push(("branch", branch_str.as_str()));
         }
         self.post_json(&path, &query, &(), "list_table_versions", &id)
             .await
@@ -1397,6 +1450,45 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
+    async fn alter_table_backfill_columns(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    async fn refresh_materialized_view(
+        &self,
+        request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+            .await
+    }
+
+    async fn create_materialized_view(
+        &self,
+        request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        self.record_op("create_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_materialized_view", &id)
+            .await
+    }
+
     async fn list_table_tags(
         &self,
         request: ListTableTagsRequest,
@@ -1468,6 +1560,55 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/tags/update", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "update_table_tag", &id)
+            .await
+    }
+
+    async fn create_table_branch(
+        &self,
+        request: CreateTableBranchRequest,
+    ) -> Result<CreateTableBranchResponse> {
+        self.record_op("create_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_branch", &id)
+            .await
+    }
+
+    async fn list_table_branches(
+        &self,
+        request: ListTableBranchesRequest,
+    ) -> Result<ListTableBranchesResponse> {
+        self.record_op("list_table_branches");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.post_json(&path, &query, &request, "list_table_branches", &id)
+            .await
+    }
+
+    async fn delete_table_branch(
+        &self,
+        request: DeleteTableBranchRequest,
+    ) -> Result<DeleteTableBranchResponse> {
+        self.record_op("delete_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "delete_table_branch", &id)
             .await
     }
 
@@ -1794,6 +1935,75 @@ mod tests {
 
         // Should succeed with mock server
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_table_sends_properties_and_storage_options_query_params() {
+        use std::collections::HashMap;
+
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/create".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "location": "/path/to/table",
+                "version": 1,
+                "properties": {
+                    "owner": "alice",
+                    "team": "eng"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = CreateTableRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            mode: Some("Create".to_string()),
+            properties: Some(HashMap::from([
+                ("owner".to_string(), "alice".to_string()),
+                ("team".to_string(), "eng".to_string()),
+            ])),
+            storage_options: Some(HashMap::from([
+                ("aws_region".to_string(), "us-east-1".to_string()),
+                ("timeout".to_string(), "30s".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let result = namespace
+            .create_table(request, Bytes::from("arrow data here"))
+            .await;
+
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+
+        let query_params: HashMap<String, String> =
+            request.url.query_pairs().into_owned().collect();
+        assert_eq!(query_params.get("mode"), Some(&"Create".to_string()));
+
+        let properties: serde_json::Value =
+            serde_json::from_str(query_params.get("properties").unwrap()).unwrap();
+        assert_eq!(
+            properties,
+            serde_json::json!({"owner": "alice", "team": "eng"})
+        );
+
+        let storage_options: serde_json::Value =
+            serde_json::from_str(query_params.get("storage_options").unwrap()).unwrap();
+        assert_eq!(
+            storage_options,
+            serde_json::json!({"aws_region": "us-east-1", "timeout": "30s"})
+        );
     }
 
     #[tokio::test]

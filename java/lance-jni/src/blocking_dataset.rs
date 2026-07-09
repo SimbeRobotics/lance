@@ -9,8 +9,9 @@ use crate::namespace::{
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_rust_map,
+    build_compaction_options, extract_base_store_params, extract_storage_options,
+    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
+    to_rust_map,
 };
 use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
@@ -28,7 +29,10 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
+use lance::dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
+    CleanupReferencedBranch, RemovalStats,
+};
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -37,7 +41,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, IndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -48,7 +52,6 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::noop_progress;
-use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -61,6 +64,7 @@ use std::iter::empty;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -144,6 +148,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        base_store_params: HashMap<String, ObjectStoreParams>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
@@ -183,6 +188,10 @@ impl BlockingDataset {
 
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
 
+        for (base_path, store_params) in base_store_params {
+            builder = builder.with_base_store_params(base_path, store_params);
+        }
+
         if let Some(ver) = version {
             builder = builder.with_version(ver);
         }
@@ -195,7 +204,8 @@ impl BlockingDataset {
         if namespace_client_managed_versioning
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
-            let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+            let external_store =
+                LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, uri)?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -237,10 +247,6 @@ impl BlockingDataset {
     pub fn latest_version(&self) -> Result<u64> {
         let version = RT.block_on(self.inner.latest_version_id())?;
         Ok(version)
-    }
-
-    pub fn version_id(&self) -> u64 {
-        self.inner.version_id()
     }
 
     pub fn list_versions(&self) -> Result<Vec<Version>> {
@@ -317,6 +323,24 @@ impl BlockingDataset {
         Ok(())
     }
 
+    pub fn replace_tag_metadata(
+        &mut self,
+        tag: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.tags().replace_metadata(tag, metadata))?;
+        Ok(())
+    }
+
+    pub fn replace_branch_metadata(
+        &mut self,
+        branch: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.branches().replace_metadata(branch, metadata))?;
+        Ok(())
+    }
+
     pub fn get_version(&self, tag: &str) -> Result<u64> {
         let version = RT.block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
@@ -349,11 +373,13 @@ impl BlockingDataset {
         max_retries: u32,
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        commit_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
             .with_detached(detached)
-            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+            .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_timeout(commit_timeout);
         if let Some(use_stable) = use_stable_row_ids {
             builder = builder.use_stable_row_ids(use_stable);
         }
@@ -391,6 +417,18 @@ impl BlockingDataset {
         Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
     }
 
+    pub fn explain_cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+        max_candidate_files: Option<usize>,
+    ) -> Result<CleanupExplanation> {
+        let mut op = self.inner.cleanup(policy);
+        if let Some(limit) = max_candidate_files {
+            op = op.with_max_candidate_files(limit);
+        }
+        Ok(RT.block_on(op.explain())?)
+    }
+
     pub fn close(&self) {}
 }
 
@@ -411,6 +449,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -430,6 +469,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
@@ -451,6 +491,7 @@ fn inner_create_with_ffi_schema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -472,6 +513,7 @@ fn inner_create_with_ffi_schema<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
@@ -529,6 +571,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     data_storage_version: JObject,                 // Optional<String>
     enable_v2_manifest_paths: JObject,             // Optional<Boolean>
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     initial_bases: JObject,                        // Optional<List<BasePath>>
     target_bases: JObject,                         // Optional<List<String>>
     allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
@@ -551,6 +594,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
@@ -575,6 +619,7 @@ fn inner_create_with_ffi_stream<'local>(
     data_storage_version: JObject,              // Optional<String>
     enable_v2_manifest_paths: JObject,          // Optional<Boolean>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
     initial_bases: JObject,                     // Optional<List<BasePath>>
     target_bases: JObject,                      // Optional<List<String>>
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -600,6 +645,7 @@ fn inner_create_with_ffi_stream<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
@@ -627,6 +673,7 @@ fn create_dataset<'local>(
     data_storage_version: JObject,
     enable_v2_manifest_paths: JObject,
     storage_options_obj: JObject,
+    base_store_params_obj: JObject,
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
@@ -647,6 +694,7 @@ fn create_dataset<'local>(
         &data_storage_version,
         Some(&enable_v2_manifest_paths),
         &storage_options_obj,
+        &base_store_params_obj,
         &initial_bases,
         &target_bases,
         &allow_external_blob_outside_bases,
@@ -657,8 +705,11 @@ fn create_dataset<'local>(
     if let Some((namespace, table_id)) = namespace_info {
         // Set up commit handler only if namespace manages versioning
         if namespace_client_managed_versioning {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                namespace.clone(),
+                table_id.clone(),
+                &path_str,
+            )?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -920,7 +971,13 @@ fn inner_create_index<'local>(
     let fragment_ids = env
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
-    let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
+    let index_uuid = env
+        .get_string_opt(&index_uuid_jobj)?
+        .map(|s| {
+            Uuid::parse_str(&s)
+                .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))
+        })
+        .transpose()?;
     let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
     let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
         let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
@@ -943,6 +1000,7 @@ fn inner_create_index<'local>(
         | IndexType::NGram
         | IndexType::ZoneMap
         | IndexType::BloomFilter
+        | IndexType::Fm
         | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
@@ -950,7 +1008,7 @@ fn inner_create_index<'local>(
                 index_type: index_type_str,
                 params: params_opt.clone(),
             };
-            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
+            skip_commit = skip_commit || (index_type == IndexType::BTree && batch_reader.is_some());
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -1030,20 +1088,6 @@ fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> R
     Ok(())
 }
 
-fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
-    match index_type {
-        IndexType::BTree => {
-            // Should defer the commit if we are building range-based BTree index
-            if let Some(params) = params_opt {
-                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
-                return Ok(btree_parameters.range_id.is_some());
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadata<'local>(
     mut env: JNIEnv<'local>,
@@ -1071,7 +1115,9 @@ fn inner_merge_index_metadata(
     index_type_code_jobj: jint,
     batch_readhead_jobj: JObject, // Optional<Integer>
 ) -> Result<()> {
-    let index_uuid = index_uuid.extract(env)?;
+    let index_uuid_str = index_uuid.extract(env)?;
+    let index_uuid = Uuid::parse_str(&index_uuid_str)
+        .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let batch_readhead = env
         .get_int_opt(&batch_readhead_jobj)?
@@ -1144,7 +1190,12 @@ fn inner_commit_existing_index_segments<'local>(
 ) -> Result<JObject<'local>> {
     let index_name = index_name.extract(env)?;
     let column = column.extract(env)?;
-    let segments = import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+    let segment_metadata =
+        import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+    let segments = segment_metadata
+        .iter()
+        .map(index_metadata_to_segment)
+        .collect::<Result<Vec<_>>>()?;
 
     let committed = {
         let mut dataset_guard =
@@ -1158,6 +1209,28 @@ fn inner_commit_existing_index_segments<'local>(
     };
 
     export_vec(env, &committed)
+}
+
+fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
+    let fragment_bitmap = metadata.fragment_bitmap.clone().ok_or_else(|| {
+        Error::input_error(format!(
+            "Segment '{}' is missing fragment coverage metadata",
+            metadata.uuid
+        ))
+    })?;
+    let index_details = metadata.index_details.clone().ok_or_else(|| {
+        Error::input_error(format!(
+            "Segment '{}' is missing index details metadata",
+            metadata.uuid
+        ))
+    })?;
+
+    Ok(IndexSegment::new(
+        metadata.uuid,
+        fragment_bitmap,
+        index_details,
+        metadata.index_version,
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -1221,6 +1294,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     serialized_manifest: JObject,                  // Optional<ByteBuffer>
     session_handle: jlong,                         // Session handle, 0 means no session
     namespace_obj: JObject,                        // LanceNamespace object, null if no namespace
@@ -1237,6 +1311,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj,
+            base_store_params_obj,
             serialized_manifest,
             session_handle,
             namespace_obj,
@@ -1255,6 +1330,7 @@ fn inner_open_native<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,              // Map<String, String>
+    base_store_params_obj: JObject,            // Map<String, Map<String, String>>
     serialized_manifest: JObject,              // Optional<ByteBuffer>
     session_handle: jlong,                     // Session handle, 0 means no session
     namespace_obj: JObject,                    // LanceNamespace object, null if no namespace
@@ -1266,6 +1342,7 @@ fn inner_open_native<'local>(
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let base_store_params = extract_base_store_params(env, &base_store_params_obj)?;
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
@@ -1295,6 +1372,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        base_store_params,
         serialized_manifest,
         storage_options_provider_arc,
         session,
@@ -1539,20 +1617,6 @@ fn inner_get_version<'local>(
         dataset_guard.version()?
     };
     version.into_java(env)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionId(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-) -> jlong {
-    ok_or_throw_with_return!(env, inner_get_version_id(&mut env, java_dataset), -1) as jlong
-}
-
-fn inner_get_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    Ok(dataset_guard.version_id())
 }
 
 #[unsafe(no_mangle)]
@@ -1979,6 +2043,116 @@ fn inner_take(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeTakeRows(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> jbyteArray {
+    match inner_take_rows(&mut env, java_dataset, row_ids_obj, columns_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_take_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> Result<jbyteArray> {
+    let row_ids: Vec<i64> = env.get_longs(&row_ids_obj)?;
+    let row_ids_u64: Vec<u64> = row_ids.iter().map(|&x| x as u64).collect();
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+
+        match RT.block_on(dataset.take_rows(&row_ids_u64, projection)) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeSample(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    n: jlong,
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+) -> jbyteArray {
+    match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_sample(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    n: jlong,
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+) -> Result<jbyteArray> {
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+    let fragment_ids: Option<Vec<i32>> = env.get_ints_opt(&fragment_ids_obj)?;
+    let fragment_ids_u32: Option<Vec<u32>> =
+        fragment_ids.map(|ids| ids.iter().map(|&id| id as u32).collect());
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = dataset
+            .schema()
+            .project_preserve_system_columns(&columns)
+            .map_err(|e| Error::runtime_error(e.to_string()))?;
+
+        match RT.block_on(dataset.sample(n as usize, &projection, fragment_ids_u32.as_deref())) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDelete(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2278,6 +2452,26 @@ fn inner_add_columns_by_schema(
 //////////////////////////////
 // Tag operation Methods    //
 //////////////////////////////
+fn optional_datetime_to_java_instant<'local>(
+    env: &mut JNIEnv<'local>,
+    timestamp: Option<&DateTime<Utc>>,
+) -> Result<JObject<'local>> {
+    if let Some(timestamp) = timestamp {
+        let seconds = timestamp.timestamp();
+        let nanos = timestamp.timestamp_subsec_nanos() as i64;
+        Ok(env
+            .call_static_method(
+                "java/time/Instant",
+                "ofEpochSecond",
+                "(JJ)Ljava/time/Instant;",
+                &[JValue::Long(seconds), JValue::Long(nanos)],
+            )?
+            .l()?)
+    } else {
+        Ok(JObject::null())
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListTags<'local>(
     mut env: JNIEnv<'local>,
@@ -2290,27 +2484,34 @@ fn inner_list_tags<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let tag_map = {
+    let mut tags: Vec<_> = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_tags()?
+        dataset_guard.list_tags()?.into_iter().collect()
     };
+    tags.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
-    for (tag_name, tag_contents) in tag_map {
+    for (tag_name, tag_contents) in tags {
         let branch_name: JObject = if let Some(branch_name) = tag_contents.branch.as_ref() {
             env.new_string(branch_name)?.into()
         } else {
             JObject::null()
         };
+        let created_at = optional_datetime_to_java_instant(env, tag_contents.created_at.as_ref())?;
+        let updated_at = optional_datetime_to_java_instant(env, tag_contents.updated_at.as_ref())?;
+        let java_metadata = to_java_map(env, &tag_contents.metadata)?;
         let java_tag = env.new_object(
             "org/lance/Tag",
-            "(Ljava/lang/String;Ljava/lang/String;JI)V",
+            "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;Ljava/time/Instant;Ljava/util/Map;)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
+                JValue::Object(&created_at),
+                JValue::Object(&updated_at),
+                JValue::Object(&java_metadata),
             ],
         )?;
         env.call_method(
@@ -2393,6 +2594,32 @@ fn inner_update_tag(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeReplaceTagMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_tag_metadata(&mut env, java_dataset, jtag_name, jmetadata)
+    )
+}
+
+fn inner_replace_tag_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) -> Result<()> {
+    let tag = jtag_name.extract(env)?;
+    let metadata = extract_metadata_map(env, &jmetadata)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_tag_metadata(tag.as_str(), metadata)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionByTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2431,11 +2658,12 @@ fn inner_list_branches<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let branches = {
+    let mut branches: Vec<_> = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_branches()?
+        dataset_guard.list_branches()?.into_iter().collect()
     };
+    branches.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
     for (name, contents) in branches {
@@ -2464,9 +2692,10 @@ fn inner_list_branches<'local>(
                 &[JValue::Object(&jmapping)],
             )?;
         }
+        let java_metadata = to_java_map(env, &contents.metadata)?;
         let jbranch = env.new_object(
             "org/lance/Branch",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJI)V",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJILjava/util/Map;)V",
             &[
                 JValue::Object(&jname),
                 JValue::Object(&jparent),
@@ -2474,6 +2703,7 @@ fn inner_list_branches<'local>(
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
+                JValue::Object(&java_metadata),
             ],
         )?;
         env.call_method(
@@ -2522,6 +2752,37 @@ fn inner_create_branch<'local>(
         BlockingDataset { inner }
     };
     new_blocking_dataset.into_java(env)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeReplaceBranchMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jbranch: JString,
+    jmetadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_branch_metadata(&mut env, java_dataset, jbranch, jmetadata)
+    )
+}
+
+fn inner_replace_branch_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jbranch: JString,
+    jmetadata: JObject,
+) -> Result<()> {
+    let branch: String = jbranch.extract(env)?;
+    let metadata = extract_metadata_map(env, &jmetadata)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.replace_branch_metadata(&branch, metadata)
+}
+
+fn extract_metadata_map(env: &mut JNIEnv, jmetadata: &JObject) -> Result<HashMap<String, String>> {
+    let jmap = JMap::from_env(env, jmetadata)?;
+    to_rust_map(env, &jmap)
 }
 
 fn transform_jref_to_ref(jref: JObject, env: &mut JNIEnv) -> Result<Ref> {
@@ -2817,43 +3078,7 @@ fn inner_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
 ) -> Result<JObject<'local>> {
-    let before_ts_millis =
-        env.get_optional_u64_from_method(&jpolicy, "getBeforeTimestampMillis")?;
-    let before_timestamp = before_ts_millis.map(|millis| {
-        let st = UNIX_EPOCH + Duration::from_millis(millis);
-        DateTime::<Utc>::from(st)
-    });
-
-    let before_version = env.get_optional_u64_from_method(&jpolicy, "getBeforeVersion")?;
-
-    let delete_unverified = env
-        .get_optional_from_method(&jpolicy, "getDeleteUnverified", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(false);
-
-    let error_if_tagged_old_versions = env
-        .get_optional_from_method(&jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(true);
-
-    let clean_referenced_branches = env
-        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(false);
-
-    let delete_rate_limit = env.get_optional_u64_from_method(&jpolicy, "getDeleteRateLimit")?;
-
-    let policy = CleanupPolicy {
-        before_timestamp,
-        before_version,
-        delete_unverified,
-        error_if_tagged_old_versions,
-        clean_referenced_branches,
-        delete_rate_limit,
-    };
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
 
     let stats = {
         let mut dataset =
@@ -2861,7 +3086,96 @@ fn inner_cleanup_with_policy<'local>(
         dataset.cleanup_with_policy(policy)
     }?;
 
-    let jstats = env.new_object(
+    cleanup_stats_to_java(env, stats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+    )
+}
+
+fn inner_explain_cleanup_with_policy<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> Result<JObject<'local>> {
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let max_candidate_files = env
+        .get_optional(&jmax_candidate_files, |env, inner| {
+            Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
+        })?
+        .map(|v| {
+            usize::try_from(v).map_err(|e| {
+                Error::input_error(format!(
+                    "maxCandidateFiles must be a non-negative usize value, got {}: {:?}",
+                    v, e
+                ))
+            })
+        })
+        .transpose()?;
+
+    let explanation = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
+    }?;
+
+    cleanup_explanation_to_java(env, explanation)
+}
+
+fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
+    let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
+    let before_timestamp = before_ts_millis.map(|millis| {
+        let st = UNIX_EPOCH + Duration::from_millis(millis);
+        DateTime::<Utc>::from(st)
+    });
+
+    let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
+
+    let delete_unverified = env
+        .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
+    let error_if_tagged_old_versions = env
+        .get_optional_from_method(jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(true);
+
+    let clean_referenced_branches = env
+        .get_optional_from_method(jpolicy, "getCleanReferencedBranches", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
+    let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
+
+    Ok(CleanupPolicy {
+        before_timestamp,
+        before_version,
+        delete_unverified,
+        error_if_tagged_old_versions,
+        clean_referenced_branches,
+        delete_rate_limit,
+    })
+}
+
+fn cleanup_stats_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    stats: RemovalStats,
+) -> Result<JObject<'local>> {
+    Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
         "(JJJJJJ)V",
         &[
@@ -2872,9 +3186,126 @@ fn inner_cleanup_with_policy<'local>(
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
         ],
-    )?;
+    )?)
+}
 
-    Ok(jstats)
+fn cleanup_file_kind_to_java(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_candidate_files_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    files: Vec<CleanupCandidateFile>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    // Wrap each iteration in a local frame so the temporary path/kind/candidate
+    // references do not accumulate on the JNI local reference table for large
+    // explanations (default limit is 1000 candidate files, but users can raise it).
+    for file in files {
+        env.with_local_frame(8, |env| {
+            let path = env.new_string(file.path)?;
+            let kind = env.new_string(cleanup_file_kind_to_java(file.kind))?;
+            let candidate = env.new_object(
+                "org/lance/cleanup/CleanupCandidateFile",
+                "(Ljava/lang/String;Ljava/lang/String;ZJ)V",
+                &[
+                    JValue::Object(&path),
+                    JValue::Object(&kind),
+                    JValue::Bool(file.unverified as jboolean),
+                    JValue::Long(file.size_bytes as i64),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&candidate)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_referenced_branches_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    branches: Vec<CleanupReferencedBranch>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for branch in branches {
+        env.with_local_frame(8, |env| {
+            let name = env.new_string(branch.name)?;
+            let referenced_branch = env.new_object(
+                "org/lance/cleanup/CleanupReferencedBranch",
+                "(Ljava/lang/String;JZ)V",
+                &[
+                    JValue::Object(&name),
+                    JValue::Long(branch.referenced_version as i64),
+                    JValue::Bool(branch.cleanup_candidate as jboolean),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&referenced_branch)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_warnings_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    warnings: Vec<String>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for warning in warnings {
+        env.with_local_frame(4, |env| {
+            let warning = env.new_string(warning)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&warning)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_explanation_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    explanation: CleanupExplanation,
+) -> Result<JObject<'local>> {
+    let stats = cleanup_stats_to_java(env, explanation.stats)?;
+    let candidate_files = cleanup_candidate_files_to_java(env, explanation.candidate_files)?;
+    let referenced_branches =
+        cleanup_referenced_branches_to_java(env, explanation.referenced_branches)?;
+    let warnings = cleanup_warnings_to_java(env, explanation.warnings)?;
+
+    Ok(env.new_object(
+        "org/lance/cleanup/CleanupExplanation",
+        "(JLorg/lance/cleanup/RemovalStats;Ljava/util/List;ZJLjava/util/List;Ljava/util/List;)V",
+        &[
+            JValue::Long(explanation.read_version as i64),
+            JValue::Object(&stats),
+            JValue::Object(&candidate_files),
+            JValue::Bool(explanation.candidate_files_truncated as jboolean),
+            JValue::Long(explanation.candidate_file_limit as i64),
+            JValue::Object(&referenced_branches),
+            JValue::Object(&warnings),
+        ],
+    )?)
 }
 
 //////////////////////////////
@@ -3122,8 +3553,8 @@ fn inner_get_zonemap_stats<'local>(
 
     let column_name: String = jcolumn_name.extract(env)?;
 
-    // 1. Get the dataset and find the zonemap index for this column
-    let zonemap_data = {
+    // 1. Get the dataset and find every committed zonemap segment for this column
+    let zonemap_batches = {
         let dataset = {
             let dataset_guard = unsafe {
                 env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
@@ -3159,127 +3590,135 @@ fn inner_get_zonemap_stats<'local>(
 
             match zonemap_desc {
                 Some(desc) => {
-                    let indices = dataset.load_indices().await.map_err(Error::from)?;
-                    let index_meta = indices.iter().find(|idx| idx.name == desc.name());
-                    match index_meta {
-                        Some(index) => {
-                            let index_store = Arc::new(
-                                LanceIndexStore::from_dataset_for_existing(&dataset, index)
-                                    .map_err(Error::from)?,
-                            );
-                            let index_file = index_store
-                                .open_index_file("zonemap.lance")
+                    let mut indices = dataset
+                        .load_indices_by_name(desc.name())
+                        .await
+                        .map_err(Error::from)?;
+                    indices.sort_by_key(|idx| {
+                        idx.fragment_bitmap
+                            .as_ref()
+                            .and_then(|bitmap| bitmap.iter().next())
+                            .unwrap_or_default()
+                    });
+
+                    let mut batches = Vec::with_capacity(indices.len());
+                    for index in &indices {
+                        let index_store = Arc::new(
+                            LanceIndexStore::from_dataset_for_existing(&dataset, index)
                                 .await
-                                .map_err(Error::from)?;
-                            let record_batch = index_file
+                                .map_err(Error::from)?,
+                        );
+                        let index_file = index_store
+                            .open_index_file("zonemap.lance")
+                            .await
+                            .map_err(Error::from)?;
+                        if index_file.num_rows() == 0 {
+                            continue;
+                        }
+                        batches.push(
+                            index_file
                                 .read_range(0..index_file.num_rows(), None)
                                 .await
-                                .map_err(Error::from)?;
-                            Ok::<_, Error>(Some(record_batch))
-                        }
-                        None => Ok(None),
+                                .map_err(Error::from)?,
+                        );
                     }
+                    Ok::<_, Error>(batches)
                 }
-                None => Ok(None),
+                None => Ok(Vec::new()),
             }
         })?
     };
 
-    // 3. Convert the RecordBatch to a Java ArrayList<ZoneStats>
+    // 3. Convert the RecordBatch rows to a Java ArrayList<ZoneStats>
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-
-    let record_batch = match zonemap_data {
-        Some(batch) => batch,
-        None => return Ok(array_list), // empty list if no zonemap index
-    };
-
-    if record_batch.num_rows() == 0 {
+    if zonemap_batches.is_empty() {
         return Ok(array_list);
     }
 
-    let min_col = record_batch
-        .column_by_name("min")
-        .ok_or_else(|| Error::input_error("ZoneMap index file missing 'min' column".to_string()))?;
-    let max_col = record_batch
-        .column_by_name("max")
-        .ok_or_else(|| Error::input_error("ZoneMap index file missing 'max' column".to_string()))?;
-    let null_count_col = record_batch
-        .column_by_name("null_count")
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'null_count' column".to_string())
-        })?
-        .as_any()
-        .downcast_ref::<arrow_array::UInt32Array>()
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
+    for record_batch in zonemap_batches {
+        let min_col = record_batch.column_by_name("min").ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'min' column".to_string())
         })?;
-    let fragment_id_col = record_batch
-        .column_by_name("fragment_id")
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'fragment_id' column".to_string())
-        })?
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap 'fragment_id' column is not UInt64".to_string())
+        let max_col = record_batch.column_by_name("max").ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'max' column".to_string())
         })?;
-    let zone_start_col = record_batch
-        .column_by_name("zone_start")
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'zone_start' column".to_string())
-        })?
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap 'zone_start' column is not UInt64".to_string())
-        })?;
-    let zone_length_col = record_batch
-        .column_by_name("zone_length")
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'zone_length' column".to_string())
-        })?
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
-        .ok_or_else(|| {
-            Error::input_error("ZoneMap 'zone_length' column is not UInt64".to_string())
-        })?;
+        let null_count_col = record_batch
+            .column_by_name("null_count")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'null_count' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
+            })?;
+        let fragment_id_col = record_batch
+            .column_by_name("fragment_id")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'fragment_id' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'fragment_id' column is not UInt64".to_string())
+            })?;
+        let zone_start_col = record_batch
+            .column_by_name("zone_start")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'zone_start' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'zone_start' column is not UInt64".to_string())
+            })?;
+        let zone_length_col = record_batch
+            .column_by_name("zone_length")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'zone_length' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'zone_length' column is not UInt64".to_string())
+            })?;
 
-    for i in 0..record_batch.num_rows() {
-        let fragment_id = fragment_id_col.value(i) as i32;
-        let zone_start = zone_start_col.value(i) as i64;
-        let zone_length = zone_length_col.value(i) as i64;
-        let null_count = null_count_col.value(i) as i64;
+        for i in 0..record_batch.num_rows() {
+            let fragment_id = fragment_id_col.value(i) as i32;
+            let zone_start = zone_start_col.value(i) as i64;
+            let zone_length = zone_length_col.value(i) as i64;
+            let null_count = null_count_col.value(i) as i64;
 
-        // Convert min/max ScalarValues to Java Comparable objects
-        let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
-            Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
-        })?;
-        let max_scalar = ScalarValue::try_from_array(max_col, i).map_err(|e| {
-            Error::input_error(format!("Failed to read max value at row {}: {}", i, e))
-        })?;
+            let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
+                Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
+            })?;
+            let max_scalar = ScalarValue::try_from_array(max_col, i).map_err(|e| {
+                Error::input_error(format!("Failed to read max value at row {}: {}", i, e))
+            })?;
 
-        let j_min = crate::utils::scalar_value_to_java(env, &min_scalar)?;
-        let j_max = crate::utils::scalar_value_to_java(env, &max_scalar)?;
+            let j_min = crate::utils::scalar_value_to_java(env, &min_scalar)?;
+            let j_max = crate::utils::scalar_value_to_java(env, &max_scalar)?;
 
-        let zone_stats = env.new_object(
-            "org/lance/index/scalar/ZoneStats",
-            "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
-            &[
-                JValue::Int(fragment_id),
-                JValue::Long(zone_start),
-                JValue::Long(zone_length),
-                JValue::Object(&j_min),
-                JValue::Object(&j_max),
-                JValue::Long(null_count),
-            ],
-        )?;
+            let zone_stats = env.new_object(
+                "org/lance/index/scalar/ZoneStats",
+                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
+                &[
+                    JValue::Int(fragment_id),
+                    JValue::Long(zone_start),
+                    JValue::Long(zone_length),
+                    JValue::Object(&j_min),
+                    JValue::Object(&j_max),
+                    JValue::Long(null_count),
+                ],
+            )?;
 
-        env.call_method(
-            &array_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&zone_stats)],
-        )?;
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&zone_stats)],
+            )?;
+        }
     }
 
     Ok(array_list)

@@ -38,6 +38,8 @@ use lance_core::{
 };
 use log::trace;
 
+use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
+use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
@@ -50,16 +52,13 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockChunk, utils::bytepack::ByteUnpacker,
-};
-use crate::{
     encodings::logical::primitive::miniblock::MiniBlockCompressed,
     statistics::{ComputeStat, GetStat, Stat},
 };
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, build_control_word_iterator,
+        RepDefSlicer, SerializedRepDefs, StructuralPagePlan, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -777,6 +776,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_rep: u16,
     max_visible_level: u16,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
@@ -793,6 +793,7 @@ impl ComplexAllNullScheduler {
         num_rep_values: u64,
         num_def_values: u64,
     ) -> Self {
+        let max_rep = def_meaning.iter().filter(|l| l.is_list()).count() as u16;
         let max_visible_level = def_meaning
             .iter()
             .take_while(|l| !l.is_list())
@@ -802,6 +803,7 @@ impl ComplexAllNullScheduler {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_rep,
             max_visible_level,
             rep_decompressor,
             def_decompressor,
@@ -940,7 +942,10 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_rep: self.max_rep,
             max_visible_level: self.max_visible_level,
+            cursor_row: 0,
+            cursor_level: 0,
         }) as Box<dyn StructuralPageDecoder>;
         let page_load_task = PageLoadTask {
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
@@ -957,7 +962,10 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_rep: u16,
     max_visible_level: u16,
+    cursor_row: u64,
+    cursor_level: usize,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -978,13 +986,80 @@ impl ComplexAllNullPageDecoder {
         }
         ranges
     }
+
+    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+        let start = self.cursor_level;
+        let end = if let Some(rep) = &self.rep {
+            if start >= rep.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: repetition buffer too short",
+                ));
+            }
+            if rep[start] != self.max_rep {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: row did not start at max repetition level",
+                ));
+            }
+            let mut end = start + 1;
+            while end < rep.len() && rep[end] != self.max_rep {
+                end += 1;
+            }
+            end
+        } else {
+            start + 1
+        };
+
+        let visible = if let Some(def) = &self.def {
+            if end > def.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: definition buffer too short",
+                ));
+            }
+            def[start..end]
+                .iter()
+                .filter(|d| **d <= self.max_visible_level)
+                .count() as u64
+        } else {
+            (end - start) as u64
+        };
+
+        self.cursor_level = end;
+        self.cursor_row += 1;
+        Ok((start..end, visible))
+    }
+
+    fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        while self.cursor_row < target_row {
+            self.take_row()?;
+        }
+        Ok(())
+    }
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
+        let mut level_slices: Vec<Range<usize>> = Vec::new();
+        let mut visible_items_total = 0;
+
+        for range in drained_ranges {
+            self.skip_to_row(range.start)?;
+            for _ in range.start..range.end {
+                let (level_range, visible) = self.take_row()?;
+                visible_items_total += visible;
+                if let Some(last) = level_slices.last_mut()
+                    && last.end == level_range.start
+                {
+                    last.end = level_range.end;
+                    continue;
+                }
+                level_slices.push(level_range);
+            }
+        }
+
         Ok(Box::new(DecodeComplexAllNullTask {
-            ranges: drained_ranges,
+            level_slices,
+            visible_items_total,
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
@@ -997,11 +1072,12 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     }
 }
 
-/// We use `ranges` to slice into `rep` and `def` and create rep/def buffers
+/// We use `level_slices` to slice into `rep` and `def` and create rep/def buffers
 /// for the null data.
 #[derive(Debug)]
 pub struct DecodeComplexAllNullTask {
-    ranges: Vec<Range<u64>>,
+    level_slices: Vec<Range<usize>>,
+    visible_items_total: u64,
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
@@ -1009,19 +1085,16 @@ pub struct DecodeComplexAllNullTask {
 }
 
 impl DecodeComplexAllNullTask {
-    fn decode_level(
-        &self,
-        levels: &Option<ScalarBuffer<u16>>,
-        num_values: u64,
-    ) -> Option<Vec<u16>> {
+    fn decode_level(&self, levels: &Option<ScalarBuffer<u16>>) -> Option<Vec<u16>> {
         levels.as_ref().map(|levels| {
-            let mut referenced_levels = Vec::with_capacity(num_values as usize);
-            for range in &self.ranges {
-                referenced_levels.extend(
-                    levels[range.start as usize..range.end as usize]
-                        .iter()
-                        .copied(),
-                );
+            let num_levels = self
+                .level_slices
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum();
+            let mut referenced_levels = Vec::with_capacity(num_levels);
+            for range in &self.level_slices {
+                referenced_levels.extend(levels[range.start..range.end].iter().copied());
             }
             referenced_levels
         })
@@ -1030,9 +1103,8 @@ impl DecodeComplexAllNullTask {
 
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let rep = self.decode_level(&self.rep, num_values);
-        let def = self.decode_level(&self.def, num_values);
+        let rep = self.decode_level(&self.rep);
+        let def = self.decode_level(&self.def);
 
         // If there are definition levels there may be empty / null lists which are not visible
         // in the items array.  We need to account for that here to figure out how many values
@@ -1040,7 +1112,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         let num_values = if let Some(def) = &def {
             def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
         } else {
-            num_values
+            self.visible_items_total
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
@@ -2386,7 +2458,15 @@ impl FullZipScheduler {
 
         // Convert item ranges to byte ranges (i.e. multiply by bytes per item)
         let bits_per_value = decompressor.bits_per_value();
-        assert_eq!(bits_per_value % 8, 0);
+        if !bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                    bits_per_value
+                )
+                .into(),
+            ));
+        }
         let bytes_per_value = bits_per_value / 8;
         let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
         let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
@@ -3217,6 +3297,12 @@ struct PageInfoAndScheduler {
 pub struct StructuralPrimitiveFieldScheduler {
     page_schedulers: Vec<PageInfoAndScheduler>,
     column_index: u32,
+    // Identifies the requested decode shape (e.g. blob descriptor struct vs
+    // raw bytes). Blob columns can produce multiple page scheduler variants
+    // for the same physical column depending on the target field's data type,
+    // and the cached page state types differ per variant. The view tag is
+    // mixed into the cache key so different variants do not collide.
+    view_tag: String,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -3243,6 +3329,7 @@ impl StructuralPrimitiveFieldScheduler {
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
+            view_tag: format!("{:?}", target_field.data_type()),
         })
     }
 
@@ -3401,16 +3488,25 @@ impl DeepSizeOf for CachedFieldData {
 }
 
 // Cache key for field data
+//
+// Both `column_index` and `view_tag` are part of the key because a single
+// physical column can be decoded under more than one shape — a blob column,
+// for instance, materializes as a `Struct<position, size>` descriptor in one
+// scheduler variant and as the raw `LargeBinary` bytes in another. Each
+// variant builds different `CachedPageData` types per page, so two readers
+// that hit the same `column_index` with different shapes used to collide and
+// crash with a downcast failure when loading cached state.
 #[derive(Debug, Clone)]
 pub struct FieldDataCacheKey {
     pub column_index: u32,
+    pub view_tag: String,
 }
 
 impl CacheKey for FieldDataCacheKey {
     type ValueType = CachedFieldData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        self.column_index.to_string().into()
+        format!("{}:{}", self.column_index, self.view_tag).into()
     }
 
     fn type_name() -> &'static str {
@@ -3426,6 +3522,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = FieldDataCacheKey {
             column_index: self.column_index,
+            view_tag: self.view_tag.clone(),
         };
         let cache = context.cache().clone();
 
@@ -3563,7 +3660,18 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         let mut remaining = num_rows;
         let mut tasks = Vec::new();
         while remaining > 0 {
-            let cur_page = self.page_decoders.front_mut().unwrap();
+            let queued_pages = self.page_decoders.len();
+            let Some(cur_page) = self.page_decoders.front_mut() else {
+                return Err(Error::internal(format!(
+                    "Primitive decoder missing page decoder while draining field '{}' (data_type={:?}, requested_rows={}, remaining_rows={}, rows_drained_in_current={}, queued_pages={})",
+                    self.field.name(),
+                    self.field.data_type(),
+                    num_rows,
+                    remaining,
+                    self.rows_drained_in_current,
+                    queued_pages
+                )));
+            };
             let num_in_page = cur_page.num_rows() - self.rows_drained_in_current;
             let to_take = num_in_page.min(remaining);
 
@@ -3604,12 +3712,7 @@ struct SerializedFullZip {
 //
 // If we directly record the size in bytes with 12 bits we would be limited to
 // 4KiB which is too small.  Since we know each mini-block consists of 8 byte
-// words we can store the # of words instead which gives us 32KiB.  We want
-// at least 24KiB so we can handle even the worst case of
-// - 4Ki values compressed into an 8186 byte buffer
-// - 4 bytes to describe rep & def lengths
-// - 16KiB of rep & def buffer (this will almost never happen but life is easier if we
-//   plan for it)
+// words we can store the # of words instead which gives us 32KiB.
 //
 // Second, each chunk in a mini-block is aligned to 8 bytes.  This allows multi-byte
 // values like offsets to be stored in a mini-block and safely read back out.  It also
@@ -3684,6 +3787,44 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
+// A primitive page after optional structural splitting.
+struct PrimitivePageData {
+    // Arrow leaf arrays that contain this page's visible values.
+    arrays: Vec<ArrayRef>,
+    // Repetition / definition levels aligned to this page.
+    repdef: SerializedRepDefs,
+    // Top-level row number of the first row in this page.
+    row_number: u64,
+    // Number of top-level rows in this page.
+    num_rows: u64,
+    // Present when one top-level row is too large for one miniblock rep/def chunk.
+    unsplittable_miniblock_levels: Option<u64>,
+}
+
+// Immutable encoder state shared by per-page encode tasks.
+//
+// Cloning this only clones Arc-backed configuration and field metadata.  Page data
+// stays in PrimitivePageData and is moved into exactly one task.
+#[derive(Clone)]
+struct PrimitiveEncodeContext {
+    // Column being encoded.
+    column_idx: u32,
+    // Logical field metadata for compression/layout selection.
+    field: Field,
+    // Compression strategy shared across pages.
+    compression_strategy: Arc<dyn CompressionStrategy>,
+    // Field-level encoding metadata such as structural encoding overrides.
+    encoding_metadata: Arc<HashMap<String, String>>,
+    // Whether miniblock chunks may use the v2.2 large-chunk metadata.
+    support_large_chunk: bool,
+    // Lance file version selected by the writer.
+    version: LanceFileVersion,
+    // True when the only rep/def information is simple nullable validity.
+    is_simple_validity: bool,
+    // True when the field has any non-empty rep/def information.
+    has_repdef_info: bool,
+}
+
 impl PrimitiveStructuralEncoder {
     pub fn try_new(
         options: &EncodingOptions,
@@ -3743,66 +3884,6 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
-    /// Checks if the rep/def levels are too sparse for miniblock encoding.
-    ///
-    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
-    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
-    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
-    /// lists, the number of rep/def levels can far exceed the number of data values
-    /// (each empty list adds a level entry with no corresponding data value).
-    ///
-    /// We estimate the compressed bits per level by computing the max value in each
-    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
-    /// bitpack each level. We then calculate the maximum number of levels that fit
-    /// in 16KiB and compare against the actual levels-to-values ratio.
-    fn repdef_too_sparse_for_miniblock(
-        repdef: &crate::repdef::SerializedRepDefs,
-        num_values: u64,
-    ) -> bool {
-        if num_values == 0 {
-            return false;
-        }
-        let num_levels = repdef
-            .repetition_levels
-            .as_ref()
-            .map(|r| r.len() as u64)
-            .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
-            .unwrap_or(0);
-        if num_levels == 0 {
-            return false;
-        }
-
-        // Compute bits needed per level for each buffer (ceil of log2(max+1))
-        let bits_per_rep = repdef
-            .repetition_levels
-            .as_ref()
-            .and_then(|r| r.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-        let bits_per_def = repdef
-            .definition_levels
-            .as_ref()
-            .and_then(|d| d.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-
-        let bits_per_level = bits_per_rep + bits_per_def;
-        if bits_per_level == 0 {
-            return false;
-        }
-
-        // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
-        const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
-        let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
-
-        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
-        // ratio tells us how many levels a chunk of that size would need.
-        let levels_per_chunk =
-            (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
-
-        levels_per_chunk > max_levels_per_chunk as f64
-    }
-
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
         // Fullzip is the backup option so the only reason we wouldn't use it is if the
         // user specifically requested not to use it (in which case we're probably going
@@ -3831,9 +3912,9 @@ impl PrimitiveStructuralEncoder {
     // 0xA)  All blocks except the last must have power-of-two number of values.
     // This not only makes metadata smaller but it makes decoding easier since
     // batch sizes are typically a power of 2.  4 bits would allow us to express
-    // up to 16Ki values but we restrict this further to 4Ki values.
+    // up to 32Ki values.
     //
-    // This means blocks can have 1 to 4Ki values and 8 - 32Ki bytes.
+    // This means blocks can have 1 to 32Ki values and 8 - 32Ki bytes.
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
@@ -3932,7 +4013,13 @@ impl PrimitiveStructuralEncoder {
                 }
             } else {
                 for &buffer_size in &chunk.buffer_sizes {
-                    data_buffer.extend_from_slice(&(buffer_size as u16).to_le_bytes());
+                    let buffer_size = u16::try_from(buffer_size).map_err(|_| {
+                        Error::internal(format!(
+                            "Mini-block buffer size ({} bytes) too large for 16-bit metadata",
+                            buffer_size
+                        ))
+                    })?;
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
                 }
             }
 
@@ -3966,15 +4053,28 @@ impl PrimitiveStructuralEncoder {
 
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = if support_large_chunk {
-                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+                1_u64 << 31 // 28 bits of 8-byte words in u32 metadata
             } else {
                 32 * 1024 // 32KiB limit with u16 metadata
             };
-            assert!(chunk_bytes <= max_chunk_size);
-            assert!(chunk_bytes > 0);
-            assert_eq!(chunk_bytes % 8, 0);
-            // 4Ki values max
-            assert!(chunk.log_num_values <= 12);
+            if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes exceeds the {} byte metadata limit",
+                    chunk_bytes, max_chunk_size
+                )));
+            }
+            if chunk_bytes % MINIBLOCK_ALIGNMENT != 0 {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes is not aligned to {} bytes",
+                    chunk_bytes, MINIBLOCK_ALIGNMENT
+                )));
+            }
+            if chunk.log_num_values > 15 {
+                return Err(Error::internal(format!(
+                    "Mini-block log_num_values {} exceeds the 4-bit metadata limit",
+                    chunk.log_num_values
+                )));
+            }
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
@@ -4104,9 +4204,20 @@ impl PrimitiveStructuralEncoder {
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
+            let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
+                Error::invalid_input_source(
+                    format!(
+                        "Mini-block cannot encode {} rep/def levels in one chunk. \
+                         This usually means a top-level row contains too much nested structure \
+                         for the current layout.",
+                        num_chunk_levels
+                    )
+                    .into(),
+                )
+            })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
-                num_levels: num_chunk_levels as u16,
+                num_levels,
             });
         }
         debug_assert_eq!(levels.num_levels_remaining(), 0);
@@ -4598,7 +4709,17 @@ impl PrimitiveStructuralEncoder {
         fixed: FixedWidthDataBlock,
         mut repdef: ControlWordIterator,
         num_values: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
+        if !fixed.bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                    fixed.bits_per_value
+                )
+                .into(),
+            ));
+        }
+
         let len = fixed.data.len() + repdef.bytes_per_word() * num_values as usize;
         let mut zipped_data = Vec::with_capacity(len);
 
@@ -4610,14 +4731,6 @@ impl PrimitiveStructuralEncoder {
         };
         let mut rep_index_builder =
             BytepackedIntegerEncoder::with_capacity(num_values as usize + 1, max_rep_index_val);
-
-        // I suppose we can just pad to the nearest byte but I'm not sure we need to worry about this anytime soon
-        // because it is unlikely compression of large values is going to yield a result that is not byte aligned
-        assert_eq!(
-            fixed.bits_per_value % 8,
-            0,
-            "Non-byte aligned full-zip compression not yet supported"
-        );
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
         let mut offset = 0;
@@ -4665,10 +4778,10 @@ impl PrimitiveStructuralEncoder {
         } else {
             Some(LanceBuffer::from(rep_index))
         };
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     // For variable-size data we encode < control word | length | data > for each value
@@ -4678,13 +4791,17 @@ impl PrimitiveStructuralEncoder {
         variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         let bytes_per_offset = variable.bits_per_offset as usize / 8;
-        assert_eq!(
-            variable.bits_per_offset % 8,
-            0,
-            "Only byte-aligned offsets supported"
-        );
+        if !variable.bits_per_offset.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
+                    variable.bits_per_offset
+                )
+                .into(),
+            ));
+        }
         let len = variable.data.len()
             + repdef.bytes_per_word() * num_items as usize
             + bytes_per_offset * variable.num_values as usize;
@@ -4742,7 +4859,15 @@ impl PrimitiveStructuralEncoder {
                     rep_offset = buf.len();
                 }
             }
-            _ => panic!("Unsupported offset size"),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
+                        variable.bits_per_offset
+                    )
+                    .into(),
+                ));
+            }
         }
 
         // We might have saved a few bytes by not copying lengths when the length was zero.  However,
@@ -4758,10 +4883,10 @@ impl PrimitiveStructuralEncoder {
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
         let rep_index = Some(LanceBuffer::from(rep_index));
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     /// Serializes data into a single buffer according to the full-zip format which zips
@@ -4770,7 +4895,7 @@ impl PrimitiveStructuralEncoder {
         compressed_data: PerValueDataBlock,
         repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         match compressed_data {
             PerValueDataBlock::Fixed(fixed) => {
                 Self::serialize_full_zip_fixed(fixed, repdef, num_items)
@@ -4778,6 +4903,19 @@ impl PrimitiveStructuralEncoder {
             PerValueDataBlock::Variable(var) => {
                 Self::serialize_full_zip_variable(var, repdef, num_items)
             }
+        }
+    }
+
+    fn expand_boolean_to_bytes(fixed: FixedWidthDataBlock) -> FixedWidthDataBlock {
+        debug_assert_eq!(fixed.bits_per_value, 1);
+        let num_values = fixed.num_values as usize;
+        let bool_buf = BooleanBuffer::new(fixed.data.into_buffer(), 0, num_values);
+        let expanded: Vec<u8> = (0..num_values).map(|i| bool_buf.value(i) as u8).collect();
+        FixedWidthDataBlock {
+            data: LanceBuffer::from(expanded),
+            bits_per_value: 8,
+            num_values: fixed.num_values,
+            block_info: BlockInfo::new(),
         }
     }
 
@@ -4825,6 +4963,14 @@ impl PrimitiveStructuralEncoder {
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
 
+        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            other => other,
+        };
+
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
@@ -4849,7 +4995,7 @@ impl PrimitiveStructuralEncoder {
             ),
         };
 
-        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items);
+        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items)?;
 
         let data = if let Some(repindex) = zipped.repetition_index {
             vec![zipped.values, repindex]
@@ -4960,13 +5106,19 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        // Avoid probing dictionary encoding on data that appears to be near-unique.
-        if Self::sample_is_near_unique(
-            data_block,
-            DEFAULT_SAMPLE_SIZE,
-            DEFAULT_SAMPLE_UNIQUE_RATIO,
-        )? {
-            return None;
+        // Avoid probing dictionary encoding on data that appears to be near-unique
+        // or likely to exceed the dictionary budget.
+        if let Some(sample_unique_ratio) =
+            Self::sample_unique_ratio(data_block, DEFAULT_SAMPLE_SIZE)?
+        {
+            if sample_unique_ratio >= DEFAULT_SAMPLE_UNIQUE_RATIO {
+                return None;
+            }
+
+            let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
+            if projected_cardinality > threshold_cardinality {
+                return None;
+            }
         }
 
         let max_dict_entries = u32::try_from(threshold_cardinality.min(i32::MAX as u64)).ok()?;
@@ -4976,66 +5128,79 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    /// Probe whether a page looks near-unique before attempting dictionary encoding.
+    /// Samples whether a page looks near-unique before attempting dictionary encoding.
     ///
-    /// The probe uses deterministic stride sampling (not RNG sampling), which keeps
+    /// The probe uses deterministic block sampling (not RNG sampling), which keeps
     /// the check cheap and reproducible across runs. The result is only a gate for
     /// whether we try dictionary encoding, not a cardinality statistic.
-    fn sample_is_near_unique(
-        data_block: &DataBlock,
-        max_samples: usize,
-        unique_ratio_threshold: f64,
-    ) -> Option<bool> {
+    /// Returns `Some(None)` when there are too few reliable samples or the block type does not
+    /// support dictionary encoding. Returns `None` for malformed data.
+    fn sample_unique_ratio(data_block: &DataBlock, max_samples: usize) -> Option<Option<f64>> {
         use std::collections::HashSet;
 
-        if unique_ratio_threshold <= 0.0 || unique_ratio_threshold > 1.0 {
-            return None;
-        }
+        const NUM_SAMPLE_BLOCKS: usize = 32;
+        const MIN_RELIABLE_SAMPLES: usize = 1024;
 
         let num_values = usize::try_from(data_block.num_values()).ok()?;
         if num_values == 0 {
-            return Some(false);
+            return Some(None);
         }
 
         let sample_count = num_values.min(max_samples).max(1);
-        // Uniform stride sampling across the page.
-        let step = (num_values / sample_count).max(1);
+        if sample_count < MIN_RELIABLE_SAMPLES {
+            return Some(None);
+        }
 
-        match data_block {
+        let block_count = NUM_SAMPLE_BLOCKS.min(sample_count).min(num_values).max(1);
+        let samples_per_block = (sample_count / block_count).max(1);
+        let mut indices = Vec::with_capacity(sample_count);
+        for block_idx in 0..block_count {
+            let block_start = block_idx * num_values / block_count;
+            let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
+            let block_len = next_block_start.saturating_sub(block_start);
+            let samples_in_block = samples_per_block.min(block_len);
+            indices.extend((0..samples_in_block).map(|offset| block_start + offset));
+        }
+
+        if indices.len() < MIN_RELIABLE_SAMPLES {
+            return Some(None);
+        }
+
+        let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
+                    let mut unique: HashSet<u64> =
+                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices.iter().copied() {
                         unique.insert(values.get(idx).copied()?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    // Avoid overreacting to tiny pages with too few samples.
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / indices.len() as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
+                    let mut unique: HashSet<u128> =
+                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices.iter().copied() {
                         unique.insert(values.get(idx).copied()?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / indices.len() as f64
                 }
-                _ => Some(false),
+                _ => return Some(None),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
                 // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
+                let mut unique: HashSet<u64> =
+                    HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
+                        for i in indices.iter().copied() {
                             let start = usize::try_from(*offsets.get(i)?).ok()?;
                             let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
                             if start > end || end > var.data.len() {
@@ -5047,7 +5212,7 @@ impl PrimitiveStructuralEncoder {
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
+                        for i in indices.iter().copied() {
                             let start = usize::try_from(*offsets.get(i)?).ok()?;
                             let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
                             if start > end || end > var.data.len() {
@@ -5056,16 +5221,438 @@ impl PrimitiveStructuralEncoder {
                             unique.insert(xxh3_64(&var.data[start..end]));
                         }
                     }
-                    _ => return Some(false),
+                    _ => return Some(None),
                 }
-                let ratio = unique.len() as f64 / sample_count as f64;
-                Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                unique.len() as f64 / indices.len() as f64
             }
-            _ => Some(false),
+            _ => return Some(None),
+        };
+
+        Some(Some(ratio))
+    }
+
+    fn slice_repdef(repdef: &SerializedRepDefs, range: Range<usize>) -> SerializedRepDefs {
+        let repetition_levels = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|levels| levels[range.clone()].to_vec());
+        let definition_levels = repdef
+            .definition_levels
+            .as_ref()
+            .map(|levels| levels[range].to_vec());
+        SerializedRepDefs::new_with_fixed_size_list_levels(
+            repetition_levels,
+            definition_levels,
+            repdef.def_meaning.clone(),
+            repdef.has_fixed_size_list_levels(),
+        )
+    }
+
+    fn slice_arrays(
+        arrays: &[ArrayRef],
+        value_start: u64,
+        num_values: u64,
+    ) -> Result<Vec<ArrayRef>> {
+        if num_values == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut values_to_skip = usize::try_from(value_start).map_err(|_| {
+            Error::invalid_input(format!("Value start {} is too large", value_start))
+        })?;
+        let mut values_remaining = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input(format!("Value count {} is too large", num_values))
+        })?;
+        let mut sliced = Vec::new();
+
+        for array in arrays {
+            if values_to_skip >= array.len() {
+                values_to_skip -= array.len();
+                continue;
+            }
+
+            let offset = values_to_skip;
+            let len = (array.len() - offset).min(values_remaining);
+            sliced.push(array.slice(offset, len));
+            values_remaining -= len;
+            values_to_skip = 0;
+
+            if values_remaining == 0 {
+                break;
+            }
+        }
+
+        if values_remaining != 0 {
+            return Err(Error::internal(format!(
+                "Page split requested {} values starting at {}, but the page did not contain enough values",
+                num_values, value_start
+            )));
+        }
+
+        Ok(sliced)
+    }
+
+    fn split_structural_pages_for_miniblock_budget(
+        arrays: Vec<ArrayRef>,
+        repdef: SerializedRepDefs,
+        plan: StructuralPagePlan,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<Vec<PrimitivePageData>> {
+        if plan == StructuralPagePlan::Fits {
+            return Ok(vec![PrimitivePageData {
+                arrays,
+                repdef,
+                row_number,
+                num_rows,
+                unsplittable_miniblock_levels: None,
+            }]);
+        }
+        if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
+            return Ok(vec![PrimitivePageData {
+                arrays,
+                repdef,
+                row_number,
+                num_rows,
+                unsplittable_miniblock_levels: Some(num_levels),
+            }]);
+        }
+
+        let StructuralPagePlan::Split(splits) = plan else {
+            unreachable!();
+        };
+
+        let mut pages = Vec::with_capacity(splits.len());
+        for split in splits {
+            let arrays = Self::slice_arrays(&arrays, split.value_start, split.num_values)?;
+            let repdef = Self::slice_repdef(&repdef, split.level_range);
+            pages.push(PrimitivePageData {
+                arrays,
+                repdef,
+                row_number: row_number + split.row_start,
+                num_rows: split.num_rows,
+                unsplittable_miniblock_levels: None,
+            });
+        }
+        Ok(pages)
+    }
+
+    fn encode_page(ctx: PrimitiveEncodeContext, page: PrimitivePageData) -> Result<EncodedPage> {
+        let PrimitiveEncodeContext {
+            column_idx,
+            field,
+            compression_strategy,
+            encoding_metadata,
+            support_large_chunk,
+            version,
+            is_simple_validity,
+            has_repdef_info,
+        } = ctx;
+        let PrimitivePageData {
+            arrays,
+            repdef,
+            row_number,
+            num_rows,
+            unsplittable_miniblock_levels,
+        } = page;
+        let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
+        if num_values == 0 {
+            // This page contains only structural events, such as empty/null list rows.
+            // The existing complex-null layout stores the rep/def stream without value buffers.
+            log::debug!(
+                "Encoding column {} with {} items ({} rows) using complex-null layout",
+                column_idx,
+                num_values,
+                num_rows
+            );
+            return Self::encode_complex_all_null(
+                column_idx,
+                repdef,
+                row_number,
+                num_rows,
+                version,
+                compression_strategy.as_ref(),
+            );
+        }
+
+        let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
+        let all_null = leaf_validity
+            .as_ref()
+            .map(|validity| validity.count_set_bits() == 0)
+            .unwrap_or(false);
+
+        if all_null {
+            return if is_simple_validity {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using simple-null layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                Self::encode_simple_all_null(column_idx, num_values, row_number)
+            } else {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using complex-null layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                Self::encode_complex_all_null(
+                    column_idx,
+                    repdef,
+                    row_number,
+                    num_rows,
+                    version,
+                    compression_strategy.as_ref(),
+                )
+            };
+        }
+
+        if let DataType::Struct(fields) = &field.data_type()
+            && fields.is_empty()
+        {
+            if has_repdef_info {
+                return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
+            }
+            // This is maybe a little confusing but the reader should never look at this anyways and it
+            // seems like overkill to invent a new layout just for "empty structs".
+            return Self::encode_simple_all_null(column_idx, num_values, row_number);
+        }
+
+        let data_block = DataBlock::from_arrays(&arrays, num_values);
+
+        if version.resolve() >= LanceFileVersion::V2_2
+            && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+        {
+            log::debug!(
+                "Encoding column {} with {} items ({} rows) using constant layout",
+                column_idx,
+                num_values,
+                num_rows
+            );
+            return constant::encode_constant_page(
+                column_idx, scalar, repdef, row_number, num_rows,
+            );
+        }
+
+        if let Some(num_levels) = unsplittable_miniblock_levels {
+            let requested_encoding = encoding_metadata
+                .get(STRUCTURAL_ENCODING_META_KEY)
+                .map(|requested| requested.to_lowercase());
+            let fullzip_error = match &data_block {
+                DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
+                    Some(format!(
+                        "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                        fixed.bits_per_value
+                    ))
+                }
+                DataBlock::VariableWidth(variable)
+                    if !variable.bits_per_offset.is_multiple_of(8) =>
+                {
+                    Some(format!(
+                        "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
+                        variable.bits_per_offset
+                    ))
+                }
+                DataBlock::VariableWidth(variable)
+                    if variable.bits_per_offset != 32 && variable.bits_per_offset != 64 =>
+                {
+                    Some(format!(
+                        "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
+                        variable.bits_per_offset
+                    ))
+                }
+                DataBlock::Struct(struct_data_block)
+                    if !struct_data_block.has_variable_width_child() =>
+                {
+                    Some(
+                        "Full-zip packed struct requires at least one variable-width child"
+                            .to_string(),
+                    )
+                }
+                DataBlock::Dictionary(_) => {
+                    Some("Full-zip does not encode dictionary data blocks directly".to_string())
+                }
+                DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
+                    Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
+                    Some(flat) => Some(format!(
+                        "Full-zip fixed-size-list values must be byte aligned after flattening, got {} bits per value",
+                        flat.bits_per_value
+                    )),
+                    None => Some(
+                        "Full-zip fixed-size-list capability requires a flat fixed-width child"
+                            .to_string(),
+                    ),
+                },
+                DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_) | DataBlock::Struct(_) => {
+                    None
+                }
+                other => Some(format!(
+                    "Full-zip does not support value block type {}",
+                    other.name()
+                )),
+            };
+            match requested_encoding.as_deref() {
+                Some(STRUCTURAL_ENCODING_FULLZIP) => {
+                    if let Some(reason) = fullzip_error {
+                        return Err(Error::invalid_input_source(reason.into()));
+                    }
+                    return Self::encode_full_zip(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdef,
+                        row_number,
+                        num_rows,
+                    );
+                }
+                Some(STRUCTURAL_ENCODING_MINIBLOCK) | None => {
+                    if requested_encoding.is_none() && fullzip_error.is_none() {
+                        log::debug!(
+                            "Encoding column {} with {} items using full-zip layout because mini-block cannot split the structural page",
+                            column_idx,
+                            num_values
+                        );
+                        return Self::encode_full_zip(
+                            column_idx,
+                            &field,
+                            compression_strategy.as_ref(),
+                            data_block,
+                            repdef,
+                            row_number,
+                            num_rows,
+                        );
+                    }
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Mini-block cannot encode {} rep/def levels in one top-level row. \
+                             This usually means the row contains too much nested structure \
+                             for the current layout.",
+                            num_levels
+                        )
+                        .into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let requires_full_zip_packed_struct =
+            if let DataBlock::Struct(ref struct_data_block) = data_block {
+                struct_data_block.has_variable_width_child()
+            } else {
+                false
+            };
+
+        if requires_full_zip_packed_struct {
+            log::debug!(
+                "Encoding column {} with {} items using full-zip packed struct layout",
+                column_idx,
+                num_values
+            );
+            return Self::encode_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                num_rows,
+            );
+        }
+
+        if let DataBlock::Dictionary(dict) = data_block {
+            log::debug!(
+                "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
+                column_idx,
+                num_values
+            );
+            let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+            // TODO: https://github.com/lancedb/lance/issues/4809
+            // If we compute stats on dictionary_data_block => panic.
+            // If we don't compute stats on indices_data_block => panic.
+            // This is messy.  Don't make me call compute_stat ever.
+            indices_data_block.compute_stat();
+            return Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                indices_data_block,
+                repdef,
+                row_number,
+                Some(dictionary_data_block),
+                num_rows,
+                support_large_chunk,
+            );
+        }
+
+        // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
+        // preferred structural encoding.
+        let dict_result = Self::should_dictionary_encode(&data_block, &field, version).and_then(|budget| {
+                log::debug!(
+                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                    column_idx,
+                    num_values
+                );
+                dict::dictionary_encode(
+                    &data_block,
+                    budget.max_dict_entries,
+                    budget.max_encoded_size,
+                )
+            });
+
+        if let Some((indices_data_block, dictionary_data_block)) = dict_result {
+            Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                indices_data_block,
+                repdef,
+                row_number,
+                Some(dictionary_data_block),
+                num_rows,
+                support_large_chunk,
+            )
+        } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+            log::debug!(
+                "Encoding column {} with {} items using mini-block layout",
+                column_idx,
+                num_values
+            );
+            Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                None,
+                num_rows,
+                support_large_chunk,
+            )
+        } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+            log::debug!(
+                "Encoding column {} with {} items using full-zip layout",
+                column_idx,
+                num_values
+            );
+            Self::encode_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        } else {
+            Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
         }
     }
 
-    // Creates an encode task, consuming all buffered data
+    // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
         arrays: Vec<ArrayRef>,
@@ -5073,228 +5660,40 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let column_idx = self.column_index;
-        let compression_strategy = self.compression_strategy.clone();
-        let field = self.field.clone();
-        let encoding_metadata = self.encoding_metadata.clone();
-        let support_large_chunk = self.support_large_chunk;
-        let version = self.version;
-        let task = spawn_cpu(move || {
-            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
-            let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
-            let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-            let repdef = RepDefBuilder::serialize(repdefs);
+        let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+        let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
+        let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
+        let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
+            repdefs,
+            miniblock::max_repdef_levels_per_chunk,
+            num_rows,
+            num_values,
+        )?;
+        let pages = Self::split_structural_pages_for_miniblock_budget(
+            arrays,
+            repdef,
+            structural_plan,
+            row_number,
+            num_rows,
+        )?;
 
-            if num_values == 0 {
-                // We should not encode empty arrays.  So if we get here that should mean that we
-                // either have all empty lists or all null lists (or a mix).  We still need to encode
-                // the rep/def information but we can skip the data encoding.
-                log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
-                return Self::encode_complex_all_null(
-                    column_idx,
-                    repdef,
-                    row_number,
-                    num_rows,
-                    version,
-                    compression_strategy.as_ref(),
-                );
-            }
-
-            let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
-            let all_null = leaf_validity
-                .as_ref()
-                .map(|validity| validity.count_set_bits() == 0)
-                .unwrap_or(false);
-
-            if all_null {
-                return if is_simple_validity {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using simple-null layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    Self::encode_simple_all_null(column_idx, num_values, row_number)
-                } else {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using complex-null layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    Self::encode_complex_all_null(
-                        column_idx,
-                        repdef,
-                        row_number,
-                        num_rows,
-                        version,
-                        compression_strategy.as_ref(),
-                    )
-                };
-            }
-
-            if let DataType::Struct(fields) = &field.data_type()
-                && fields.is_empty()
-            {
-                if has_repdef_info {
-                    return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
-                }
-                // This is maybe a little confusing but the reader should never look at this anyways and it
-                // seems like overkill to invent a new layout just for "empty structs".
-                return Self::encode_simple_all_null(column_idx, num_values, row_number);
-            }
-
-            let data_block = DataBlock::from_arrays(&arrays, num_values);
-
-            if version.resolve() >= LanceFileVersion::V2_2
-                && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-            {
-                log::debug!(
-                    "Encoding column {} with {} items ({} rows) using constant layout",
-                    column_idx,
-                    num_values,
-                    num_rows
-                );
-                return constant::encode_constant_page(
-                    column_idx,
-                    scalar,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
-            }
-
-            let requires_full_zip_packed_struct =
-                if let DataBlock::Struct(ref struct_data_block) = data_block {
-                    struct_data_block.has_variable_width_child()
-                } else {
-                    false
-                };
-
-            if requires_full_zip_packed_struct {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip packed struct layout",
-                    column_idx,
-                    num_values
-                );
-                return Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
-            }
-
-            // If the rep/def levels are too sparse for miniblock (e.g. many empty
-            // lists with very few values), fall back to fullzip to avoid exceeding
-            // the u16 per-chunk rep/def buffer size limit.
-            let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
-
-            if !too_sparse {
-                if let DataBlock::Dictionary(dict) = data_block {
-                    log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
-                    let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-                    // TODO: https://github.com/lancedb/lance/issues/4809
-                    // If we compute stats on dictionary_data_block => panic.
-                    // If we don't compute stats on indices_data_block => panic.
-                    // This is messy.  Don't make me call compute_stat ever.
-                    indices_data_block.compute_stat();
-                    return Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        indices_data_block,
-                        repdef,
-                        row_number,
-                        Some(dictionary_data_block),
-                        num_rows,
-                        support_large_chunk,
-                    );
-                }
-            } else {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip layout \
-                     (rep/def too sparse for mini-block)",
-                    column_idx,
-                    num_values
-                );
-            }
-
-            {
-                // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
-                // preferred structural encoding.
-                let dict_result = if too_sparse {
-                    None
-                } else {
-                    Self::should_dictionary_encode(&data_block, &field, version)
-                        .and_then(|budget| {
-                            log::debug!(
-                                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                                column_idx,
-                                num_values
-                            );
-                            dict::dictionary_encode(
-                                &data_block,
-                                budget.max_dict_entries,
-                                budget.max_encoded_size,
-                            )
-                        })
-                };
-
-                if let Some((indices_data_block, dictionary_data_block)) = dict_result {
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        indices_data_block,
-                        repdef,
-                        row_number,
-                        Some(dictionary_data_block),
-                        num_rows,
-                        support_large_chunk,
-                    )
-                } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using mini-block layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        None,
-                        num_rows,
-                        support_large_chunk,
-                    )
-                } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using full-zip layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_full_zip(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    )
-                } else {
-                    Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
-                }
-            }
-        })
-        .boxed();
-        Ok(vec![task])
+        let mut tasks = Vec::with_capacity(pages.len());
+        let ctx = PrimitiveEncodeContext {
+            column_idx: self.column_index,
+            field: self.field.clone(),
+            compression_strategy: self.compression_strategy.clone(),
+            encoding_metadata: self.encoding_metadata.clone(),
+            support_large_chunk: self.support_large_chunk,
+            version: self.version,
+            is_simple_validity,
+            has_repdef_info,
+        };
+        for page in pages {
+            let ctx = ctx.clone();
+            let task = spawn_cpu(move || Self::encode_page(ctx, page)).boxed();
+            tasks.push(task);
+        }
+        Ok(tasks)
     }
 
     fn extract_validity_buf(
@@ -5394,8 +5793,9 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor,
-        PreambleAction, StructuralPageScheduler, VariableFullZipDecoder,
+        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
+        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
+        VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
@@ -5405,17 +5805,18 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::PageEncoding;
+    use crate::decoder::{PageEncoding, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder,
+        ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
+    use crate::repdef::build_control_word_iterator;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
 
@@ -5437,6 +5838,53 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn test_primitive_decoder_empty_page_queue_returns_error() {
+        let field = Arc::new(ArrowField::new("vector", DataType::Float32, true));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let err = decoder.drain(1).unwrap_err();
+        assert!(
+            matches!(&err, lance_core::Error::Internal { .. }),
+            "expected internal error, got: {err:?}"
+        );
+        let message = err.to_string();
+        for expected in [
+            "Primitive decoder missing page decoder",
+            "field 'vector'",
+            "data_type=Float32",
+            "requested_rows=1",
+            "remaining_rows=1",
+            "rows_drained_in_current=0",
+            "queued_pages=0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "expected error to contain {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fullzip_fixed_rejects_non_byte_aligned_values() {
+        let fixed = FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8]),
+            bits_per_value: 1,
+            num_values: 8,
+            block_info: BlockInfo::new(),
+        };
+        let repdef = build_control_word_iterator(None, 0, None, 0, u16::MAX, 8);
+
+        let Err(err) = PrimitiveStructuralEncoder::serialize_full_zip_fixed(fixed, repdef, 8)
+        else {
+            panic!("expected full-zip to reject 1-bit fixed-width values");
+        };
+        assert!(
+            err.to_string().contains("byte aligned"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6572,7 +7020,7 @@ mod tests {
     #[tokio::test]
     async fn test_binary_large_minichunk_size_over_max_miniblock_values() {
         let mut string_data = Vec::new();
-        // 128kb/chunk / 6 bytes (t_9999) = 21845 > max 4096 items per chunk
+        // 128kb/chunk / 6 bytes (t_9999) = 21845 items per chunk
         for i in 0..10000 {
             string_data.push(Some(format!("t_{}", i)));
         }
@@ -6989,6 +7437,24 @@ mod tests {
         DataBlock::from_array(Arc::new(array) as ArrayRef)
     }
 
+    fn create_sorted_string_array(num_values: u64, cardinality: u64) -> ArrayRef {
+        use arrow_array::StringArray;
+
+        assert!(cardinality <= num_values && cardinality > 0);
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..num_values {
+            let value_idx = i * cardinality / num_values;
+            values.push(format!("value_{:016}", value_idx));
+        }
+
+        Arc::new(StringArray::from(values)) as ArrayRef
+    }
+
+    fn create_sorted_variable_width_block(num_values: u64, cardinality: u64) -> DataBlock {
+        DataBlock::from_array(create_sorted_string_array(num_values, cardinality))
+    }
+
     #[test]
     fn test_should_dictionary_encode() {
         use crate::constants::DICT_SIZE_RATIO_META_KEY;
@@ -7013,6 +7479,93 @@ mod tests {
             result.is_some(),
             "Should use dictionary encode based on size"
         );
+    }
+
+    #[test]
+    fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
+        let sample_count: usize = 4096;
+        let num_values: u64 = 200_000;
+        let cardinality: u64 = 8_000;
+        let run_length = num_values / cardinality;
+        let stride = num_values as usize / sample_count;
+        assert!(
+            stride > run_length as usize,
+            "test must construct the stride > run_length case"
+        );
+
+        let block = create_sorted_variable_width_block(num_values, cardinality);
+        let sample_unique_ratio =
+            PrimitiveStructuralEncoder::sample_unique_ratio(&block, sample_count).unwrap();
+
+        assert!(
+            sample_unique_ratio.is_some_and(|ratio| ratio < 0.98),
+            "sorted low-cardinality data must not be classified as near-unique"
+        );
+    }
+
+    #[test]
+    fn test_should_dictionary_encode_sorted_low_cardinality() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let block = create_sorted_variable_width_block(200_000, 8_000);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_2,
+        );
+
+        assert!(
+            result.is_some(),
+            "sorted low-cardinality data should reach dictionary encoding"
+        );
+    }
+
+    #[test]
+    fn test_should_not_dictionary_encode_sorted_high_cardinality_short_runs() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let num_values = 200_002;
+        let cardinality = 100_001;
+        let block = create_sorted_variable_width_block(num_values, cardinality);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_2,
+        );
+
+        assert!(
+            result.is_none(),
+            "sorted high-cardinality short runs should not trigger a full dictionary probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encode_sorted_low_cardinality_uses_dictionary_layout() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let array = create_sorted_string_array(200_000, 8_000);
+
+        let page = encode_first_page(field, array, LanceFileVersion::V2_2).await;
+        let _ = dictionary_encoding_from_page(&page);
     }
 
     #[test]
@@ -7063,6 +7616,36 @@ mod tests {
         assert!(
             result.is_none(),
             "Should not probe dictionary encoding for near-unique data"
+        );
+    }
+
+    #[test]
+    fn test_v2_1_miniblock_serializes_log_num_values_15() {
+        let miniblocks = MiniBlockCompressed {
+            data: vec![LanceBuffer::from(vec![1_u8; 16])],
+            chunks: vec![
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 15,
+                },
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 0,
+                },
+            ],
+            num_values: 32_769,
+        };
+
+        let serialized =
+            PrimitiveStructuralEncoder::serialize_miniblocks(miniblocks, None, None, false)
+                .unwrap();
+
+        let chunk_metadata = serialized.metadata.borrow_to_typed_slice::<u16>();
+        assert_eq!(chunk_metadata.len(), 2);
+        assert_eq!(
+            chunk_metadata[0] & 0x0F,
+            15,
+            "V2.1 metadata should use all 4 bits for log_num_values"
         );
     }
 
@@ -7413,5 +7996,26 @@ mod tests {
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    // https://github.com/lance-format/lance/issues/6681
+    #[tokio::test]
+    async fn test_sparse_boolean_list_roundtrip() {
+        use arrow_array::builder::{BooleanBuilder, ListBuilder};
+
+        let mut list_builder = ListBuilder::new(BooleanBuilder::new());
+        for i in 0..1000i32 {
+            if i % 64 == 0 {
+                // Alternate true/false so the array is not constant (constant path avoids the bug).
+                list_builder.values().append_value(i % 128 == 0);
+                list_builder.append(true);
+            } else {
+                list_builder.append(false);
+            }
+        }
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

@@ -14,7 +14,7 @@ use std::{any::Any, sync::Arc};
 use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,13 @@ pub mod pbold {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
+/// Protobuf headers for serialized index cache entries (FTS posting lists,
+/// scalar indices, and IVF vector partitions).
+pub mod cache_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+}
+
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]
@@ -77,9 +84,6 @@ pub trait Index: Send + Sync + DeepSizeOf {
 
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
-
-    /// Cast to [vector::VectorIndex]
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn vector::VectorIndex>>;
 
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;
@@ -125,6 +129,8 @@ pub enum IndexType {
 
     RTree = 10, // RTree
 
+    Fm = 11, // FM-Index
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -150,6 +156,7 @@ impl std::fmt::Display for IndexType {
             Self::ZoneMap => write!(f, "ZoneMap"),
             Self::BloomFilter => write!(f, "BloomFilter"),
             Self::RTree => write!(f, "RTree"),
+            Self::Fm => write!(f, "Fm"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -176,6 +183,8 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::MemWal as i32 => Ok(Self::MemWal),
             v if v == Self::ZoneMap as i32 => Ok(Self::ZoneMap),
             v if v == Self::BloomFilter as i32 => Ok(Self::BloomFilter),
+            v if v == Self::RTree as i32 => Ok(Self::RTree),
+            v if v == Self::Fm as i32 => Ok(Self::Fm),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -202,6 +211,9 @@ impl TryFrom<&str> for IndexType {
             "Inverted" | "INVERTED" => Ok(Self::Inverted),
             "NGram" | "NGRAM" => Ok(Self::NGram),
             "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
+            "BloomFilter" | "BLOOMFILTER" | "BLOOM_FILTER" => Ok(Self::BloomFilter),
+            "RTree" | "RTREE" | "R_TREE" => Ok(Self::RTree),
+            "Fm" | "FM" => Ok(Self::Fm),
             "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
@@ -232,7 +244,8 @@ impl IndexType {
                 | Self::NGram
                 | Self::ZoneMap
                 | Self::BloomFilter
-                | Self::RTree,
+                | Self::RTree
+                | Self::Fm,
         )
     }
 
@@ -272,6 +285,7 @@ impl IndexType {
             Self::ZoneMap => 0,
             Self::BloomFilter => 0,
             Self::RTree => 0,
+            Self::Fm => 0,
 
             // IMPORTANT: if any vector index subtype needs a format bump that is
             // not backward compatible, its new version must be set to
@@ -302,6 +316,7 @@ impl IndexType {
             Self::IvfFlat => 4096,
             Self::IvfSq => 8192,
             Self::IvfPq => 8192,
+            Self::IvfRq => 4096,
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
@@ -370,5 +385,90 @@ mod tests {
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_ivf_rq_target_partition_size() {
+        assert_eq!(IndexType::IvfRq.target_partition_size(), 4096);
+    }
+
+    #[test]
+    fn test_index_type_try_from_i32_covers_all_variants() {
+        let all = [
+            IndexType::Scalar,
+            IndexType::BTree,
+            IndexType::Bitmap,
+            IndexType::LabelList,
+            IndexType::Inverted,
+            IndexType::NGram,
+            IndexType::FragmentReuse,
+            IndexType::MemWal,
+            IndexType::ZoneMap,
+            IndexType::BloomFilter,
+            IndexType::RTree,
+            IndexType::Fm,
+            IndexType::Vector,
+            IndexType::IvfFlat,
+            IndexType::IvfSq,
+            IndexType::IvfPq,
+            IndexType::IvfHnswSq,
+            IndexType::IvfHnswPq,
+            IndexType::IvfHnswFlat,
+            IndexType::IvfRq,
+        ];
+
+        for index_type in all {
+            assert_eq!(
+                IndexType::try_from(index_type as i32).unwrap(),
+                index_type,
+                "IndexType::try_from(i32) should support {:?}",
+                index_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_type_try_from_str_covers_all_parseable_variants() {
+        let cases = [
+            ("BTree", IndexType::BTree),
+            ("BTREE", IndexType::BTree),
+            ("Bitmap", IndexType::Bitmap),
+            ("BITMAP", IndexType::Bitmap),
+            ("LabelList", IndexType::LabelList),
+            ("LABELLIST", IndexType::LabelList),
+            ("Inverted", IndexType::Inverted),
+            ("INVERTED", IndexType::Inverted),
+            ("NGram", IndexType::NGram),
+            ("NGRAM", IndexType::NGram),
+            ("ZoneMap", IndexType::ZoneMap),
+            ("ZONEMAP", IndexType::ZoneMap),
+            ("BloomFilter", IndexType::BloomFilter),
+            ("BLOOMFILTER", IndexType::BloomFilter),
+            ("BLOOM_FILTER", IndexType::BloomFilter),
+            ("RTree", IndexType::RTree),
+            ("RTREE", IndexType::RTree),
+            ("R_TREE", IndexType::RTree),
+            ("Fm", IndexType::Fm),
+            ("FM", IndexType::Fm),
+            ("Vector", IndexType::Vector),
+            ("VECTOR", IndexType::Vector),
+            ("IVF_FLAT", IndexType::IvfFlat),
+            ("IVF_SQ", IndexType::IvfSq),
+            ("IVF_PQ", IndexType::IvfPq),
+            ("IVF_RQ", IndexType::IvfRq),
+            ("IVF_HNSW_FLAT", IndexType::IvfHnswFlat),
+            ("IVF_HNSW_SQ", IndexType::IvfHnswSq),
+            ("IVF_HNSW_PQ", IndexType::IvfHnswPq),
+            ("FragmentReuse", IndexType::FragmentReuse),
+            ("MemWal", IndexType::MemWal),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(
+                IndexType::try_from(text).unwrap(),
+                expected,
+                "IndexType::try_from(&str) should support '{text}'"
+            );
+        }
     }
 }

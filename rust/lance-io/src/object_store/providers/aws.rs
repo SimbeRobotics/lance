@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, fmt, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(test)]
 use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
@@ -29,7 +29,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    StorageOptionsProvider,
+    dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -73,6 +73,12 @@ impl AwsStoreProvider {
             s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
         }
 
+        // Compute the metrics label before rewriting the url below, so it
+        // matches the prefix the registry uses to key this store.
+        #[cfg(feature = "metrics")]
+        let store_prefix =
+            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
         base_path.set_query(None);
@@ -88,6 +94,13 @@ impl AwsStoreProvider {
             .with_credentials(aws_creds)
             .with_retry(retry_config)
             .with_region(region);
+
+        #[cfg(feature = "metrics")]
+        {
+            builder = builder.with_http_connector(
+                crate::object_store::metrics::MeteringHttpConnector::new(store_prefix),
+            );
+        }
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
@@ -162,13 +175,6 @@ impl ObjectStoreProvider for AwsStoreProvider {
         };
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
         let inner = if throttle_config.is_disabled() {
-            inner
-        } else if storage_options.client_max_retries() == 0 {
-            log::warn!(
-                "AIMD throttle disabled: the current implementation relies on the object store \
-                 client surfacing retry errors, which requires client_max_retries > 0. \
-                 No throttle or retry layer will be applied."
-            );
             inner
         } else {
             Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
@@ -274,27 +280,20 @@ pub async fn build_aws_credential(
 
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
-    // If accessor has a provider, check whether it vends credentials.
-    // If it does, use DynamicStorageOptionsCredentialProvider for ongoing
-    // refresh. If not, fall through to the default credentials chain.
-    if let Some(accessor) = storage_options_accessor
-        && accessor.has_provider()
+    // Explicit aws_credentials takes precedence over dynamic credentials.
+    if credentials.is_none()
+        && let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
+            storage_options_accessor.clone(),
+        )
+        .await?
     {
-        // Explicit aws_credentials takes precedence
-        if let Some(creds) = credentials {
-            return Ok((creds, region));
-        }
+        return Ok((dynamic_creds, region));
+    }
 
-        // Check if the accessor's storage options contain credentials
-        let opts = accessor.get_storage_options().await?;
-        let s3_options = opts.as_s3_options();
-        if extract_static_s3_credentials(&s3_options).is_some() {
-            return Ok((
-                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-                region,
-            ));
-        }
-
+    if storage_options_accessor
+        .as_ref()
+        .is_some_and(|a| a.has_provider())
+    {
         log::debug!(
             "Storage options from provider do not contain explicit AWS credentials, \
              falling back to default AWS credentials chain."
@@ -467,106 +466,13 @@ impl ObjectStoreParams {
     }
 }
 
-/// AWS Credential Provider that delegates to StorageOptionsAccessor
-///
-/// This adapter converts storage options from a [`StorageOptionsAccessor`] into
-/// AWS-specific credentials that can be used with S3. All caching and refresh logic
-/// is handled by the accessor.
-///
-/// # Future Work
-///
-/// TODO: Support AWS/GCP/Azure together in a unified credential provider.
-/// Currently this is AWS-specific. Needs investigation of how GCP and Azure credential
-/// refresh mechanisms work and whether they can be unified with AWS's approach.
-///
-/// See: <https://github.com/lance-format/lance/pull/4905#discussion_r2474605265>
-pub struct DynamicStorageOptionsCredentialProvider {
-    accessor: Arc<StorageOptionsAccessor>,
-}
-
-impl fmt::Debug for DynamicStorageOptionsCredentialProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DynamicStorageOptionsCredentialProvider")
-            .field("accessor", &self.accessor)
-            .finish()
-    }
-}
-
-impl DynamicStorageOptionsCredentialProvider {
-    /// Create a new credential provider from a storage options accessor
-    pub fn new(accessor: Arc<StorageOptionsAccessor>) -> Self {
-        Self { accessor }
-    }
-
-    /// Create a new credential provider from a storage options provider
-    ///
-    /// This is a convenience constructor for backward compatibility.
-    /// The refresh offset will be extracted from storage options using
-    /// the `refresh_offset_millis` key, defaulting to 60 seconds.
-    ///
-    /// # Arguments
-    /// * `provider` - The storage options provider
-    pub fn from_provider(provider: Arc<dyn StorageOptionsProvider>) -> Self {
-        Self {
-            accessor: Arc::new(StorageOptionsAccessor::with_provider(provider)),
-        }
-    }
-
-    /// Create a new credential provider with initial credentials
-    ///
-    /// This is a convenience constructor for backward compatibility.
-    /// The refresh offset will be extracted from initial_options using
-    /// the `refresh_offset_millis` key, defaulting to 60 seconds.
-    ///
-    /// # Arguments
-    /// * `provider` - The storage options provider
-    /// * `initial_options` - Initial storage options to cache
-    pub fn from_provider_with_initial(
-        provider: Arc<dyn StorageOptionsProvider>,
-        initial_options: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            accessor: Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                initial_options,
-                provider,
-            )),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialProvider for DynamicStorageOptionsCredentialProvider {
-    type Credential = ObjectStoreAwsCredential;
-
-    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-        let storage_options = self.accessor.get_storage_options().await.map_err(|e| {
-            object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: Box::new(e),
-            }
-        })?;
-
-        let s3_options = storage_options.as_s3_options();
-        let static_creds = extract_static_s3_credentials(&s3_options).ok_or_else(|| {
-            object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: "Missing required credentials in storage options".into(),
-            }
-        })?;
-
-        static_creds
-            .get_credential()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: Box::new(e),
-            })
-    }
-}
+pub type DynamicStorageOptionsCredentialProvider =
+    NamespaceCredentialsProvider<ObjectStoreAwsCredential>;
 
 #[cfg(test)]
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
+    use crate::object_store::StorageOptionsProvider;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -627,7 +533,7 @@ mod tests {
 
         let cases = [
             ("s3://bucket/path/to/file", "path/to/file"),
-            // for non ASCII string tests
+            // for non ASCII string tests: the URL encodes them, extract_path must decode back
             ("s3://bucket/测试path/to/file", "测试path/to/file"),
             ("s3://bucket/path/&to/file", "path/&to/file"),
             ("s3://bucket/path/=to/file", "path/=to/file"),
@@ -640,9 +546,32 @@ mod tests {
         for (uri, expected_path) in cases {
             let url = Url::parse(uri).unwrap();
             let path = provider.extract_path(&url).unwrap();
-            let expected_path = Path::from(expected_path);
+            // extract_path decodes url.path(), so the Path stores the raw (decoded)
+            // string. Path::parse keeps its input verbatim, matching that, whereas
+            // Path::from would percent-encode non-ASCII bytes and not match.
+            let expected_path = Path::parse(expected_path).unwrap();
             assert_eq!(path, expected_path)
         }
+    }
+
+    // Regression test for https://github.com/lance-format/lance/issues/6643
+    // extract_path must NOT double-encode paths that contain non-ASCII characters.
+    // url.path() returns a percent-encoded string; we must decode it back to raw
+    // UTF-8 before storing it in a Path, so the object store HTTP client can apply
+    // a single, correct percent-encoding when building the request URL.
+    #[test]
+    fn test_s3_non_ascii_path_no_double_encoding() {
+        let provider = AwsStoreProvider;
+
+        // "s3://bucket/中文路径" → url.path() == "/%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84".
+        // The buggy Path::parse(url.path()) stored "%E4%B8%AD..." verbatim; the S3
+        // client then percent-encodes the '%' again, yielding "%25E4%25B8%25AD...".
+        // With Path::from_url_path the Path stores the decoded UTF-8 instead.
+        let url = Url::parse("s3://bucket/中文路径").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+
+        // The Path must hold the decoded UTF-8, not the percent-encoded form.
+        assert_eq!(path.as_ref(), "中文路径");
     }
 
     #[test]

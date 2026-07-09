@@ -23,7 +23,7 @@ use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform};
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
@@ -42,7 +42,7 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
-#[pyclass(name = "_Fragment", module = "_lib")]
+#[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
     fragment: LanceFragment,
@@ -119,7 +119,7 @@ impl FileFragment {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
-            get_write_params(kw_params)?
+            get_write_params(kw_params, dataset_uri)?
         } else {
             None
         };
@@ -385,6 +385,38 @@ impl FileFragment {
         }
     }
 
+    /// Delete rows by their local (within-fragment) physical row offsets.
+    ///
+    /// Adds the given 0-based offsets to this fragment's deletion vector and
+    /// writes a new deletion file. Returns the updated fragment, or None if every
+    /// row is now deleted. Unlike `delete(predicate)`, this deletes exactly the
+    /// supplied rows without re-evaluating a filter -- useful when the caller
+    /// already knows which rows to delete (e.g. offsets collected from a prior
+    /// scan), avoiding a redundant predicate evaluation.
+    fn delete_rows(&self, offsets: Vec<u32>) -> PyResult<Option<Self>> {
+        let old_fragment = self.fragment.clone();
+        // The core deletion path only errors once the deletion count reaches
+        // physical_rows, so out-of-range offsets must be rejected here.
+        let updated_fragment = rt()
+            .block_on(None, async {
+                let physical_rows = old_fragment.physical_rows().await?;
+                if let Some(&offset) = offsets.iter().find(|&&o| o as usize >= physical_rows) {
+                    return Err(Error::invalid_input(format!(
+                        "delete_rows offset {offset} is out of range for fragment {} \
+                         with {physical_rows} rows",
+                        old_fragment.id()
+                    )));
+                }
+                old_fragment.extend_deletions(offsets).await
+            })?
+            .infer_error()?;
+
+        match updated_fragment {
+            Some(frag) => Ok(Some(Self::new(frag))),
+            None => Ok(None),
+        }
+    }
+
     fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
@@ -435,10 +467,10 @@ fn do_write_fragments(
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
-    let params = kwargs
-        .and_then(|params| get_write_params(params).transpose())
-        .transpose()?
-        .unwrap_or_default();
+    let params = match kwargs {
+        Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
+        None => WriteParams::default(),
+    };
 
     rt().block_on(
         Some(reader.py()),
@@ -741,7 +773,12 @@ impl PyRowDatasetVersionMeta {
     }
 }
 
-#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[pyclass(
+    name = "FragmentSession",
+    module = "_lib",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct FragmentSession {
     session: Arc<lance::dataset::fragment::session::FragmentSession>,
@@ -762,8 +799,9 @@ impl FragmentSession {
     }
 }
 
-impl FromPyObject<'_> for PyLance<Fragment> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<Fragment> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
 
         let deletion_file: Option<PyRef<PyDeletionFile>> =
@@ -842,8 +880,9 @@ impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<DataFile> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<DataFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;

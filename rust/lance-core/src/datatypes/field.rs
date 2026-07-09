@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::{
     ArrayRef,
     cast::AsArray,
@@ -18,7 +19,6 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, Field as ArrowField};
-use deepsize::DeepSizeOf;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
@@ -47,6 +47,12 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 /// When not specified, primary key fields are ordered by their schema field id.
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
+
+/// Use this config key in Arrow field metadata to specify the position of a clustering key column.
+/// The value is a 1-based integer indicating the order within the composite clustering key.
+/// Clustering key fields are ordered by this position value.
+pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
+    "lance-schema:unenforced-clustering-key:position";
 
 /// Use this config key in Arrow field metadata to specify the field id of the lance field.
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
@@ -144,6 +150,11 @@ pub struct Field {
     /// None means the field is not part of the primary key.
     /// Some(n) means this field is the nth column in the primary key.
     pub unenforced_primary_key_position: Option<u32>,
+
+    /// Position of this field in the clustering key (1-based).
+    /// None means the field is not part of the clustering key.
+    /// Some(n) means this field is the nth column in the clustering key.
+    pub unenforced_clustering_key_position: Option<u32>,
 }
 
 impl Field {
@@ -258,10 +269,24 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        // For Map types, we must preserve ALL children (entries struct with key/value)
-        // Map internal structure should not be subject to projection filtering
+        // Map fields encode their physical layout as a single child entries
+        // struct (`Struct<key, value>`) whose presence is required for the
+        // parent to be readable — we never want to filter into that subtree.
+        // But the parent field itself is still subject to selection: if the
+        // caller didn't ask for this Map column, drop it like any other
+        // non-selected leaf. Without this early return the unconditional
+        // children clone would keep `children.is_empty() == false` forever
+        // and every Map column in the schema would survive every projection,
+        // pulling tens-of-bytes-per-row of unrelated data through downstream
+        // operators (notably `SortExec` in scalar-index training, where it
+        // was responsible for >100 GiB external-sort spills on real-world
+        // tables).
+        if self.logical_type.is_map() && !projection.contains_field_id(self.id) {
+            return None;
+        }
+
         let children = if self.logical_type.is_map() {
-            // Map field: keep all children intact (entries struct and its key/value fields)
+            // Map field is selected: keep all children intact.
             self.children.clone()
         } else {
             self.children
@@ -550,6 +575,18 @@ impl Field {
         }
     }
 
+    /// Convert blob v2 fields in this field tree to their descriptor view.
+    pub fn unload_blobs_recursive(&mut self) {
+        if self.is_blob_v2() {
+            self.unloaded_mut();
+            return;
+        }
+
+        for child in &mut self.children {
+            child.unload_blobs_recursive();
+        }
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -562,6 +599,7 @@ impl Field {
             children: vec![],
             dictionary: self.dictionary.clone(),
             unenforced_primary_key_position: self.unenforced_primary_key_position,
+            unenforced_clustering_key_position: self.unenforced_clustering_key_position,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -827,6 +865,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             };
             return Ok(f);
         }
@@ -887,6 +926,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             })
         }
     }
@@ -1018,6 +1058,10 @@ impl Field {
     pub fn is_unenforced_primary_key(&self) -> bool {
         self.unenforced_primary_key_position.is_some()
     }
+
+    pub fn is_unenforced_clustering_key(&self) -> bool {
+        self.unenforced_clustering_key_position.is_some()
+    }
 }
 
 impl fmt::Display for Field {
@@ -1108,6 +1152,9 @@ impl TryFrom<&ArrowField> for Field {
                     .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
                     .map(|_| 0)
             });
+        let unenforced_clustering_key_position = metadata
+            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok());
         let is_blob_v2 = has_blob_v2_extension(field);
 
         if is_blob_v2 {
@@ -1145,6 +1192,7 @@ impl TryFrom<&ArrowField> for Field {
             children,
             dictionary: None,
             unenforced_primary_key_position,
+            unenforced_clustering_key_position,
         })
     }
 }
@@ -1264,6 +1312,23 @@ mod tests {
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::from(&field), arrow_field);
         }
+    }
+
+    #[test]
+    fn test_view_types_stored_as_lance_base_types() {
+        let field = Field::try_from(&ArrowField::new("s", DataType::Utf8View, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Utf8);
+        assert_eq!(
+            LogicalType::try_from(&DataType::Utf8View).unwrap().0,
+            "string"
+        );
+
+        let field = Field::try_from(&ArrowField::new("b", DataType::BinaryView, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Binary);
+        assert_eq!(
+            LogicalType::try_from(&DataType::BinaryView).unwrap().0,
+            "binary"
+        );
     }
 
     #[test]
@@ -1809,6 +1874,54 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn unload_blobs_recursive_only_unloads_blob_v2() {
+        let legacy_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_v2_metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+
+        let mut field: Field = ArrowField::new(
+            "parent",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("legacy_blob", DataType::LargeBinary, true)
+                    .with_metadata(legacy_metadata),
+                ArrowField::new(
+                    "blob_v2",
+                    DataType::Struct(
+                        vec![
+                            ArrowField::new("data", DataType::LargeBinary, true),
+                            ArrowField::new("uri", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                )
+                .with_metadata(blob_v2_metadata),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        field.unload_blobs_recursive();
+
+        let legacy_blob = field
+            .children
+            .iter()
+            .find(|f| f.name == "legacy_blob")
+            .unwrap();
+        assert_eq!(
+            legacy_blob.logical_type,
+            LogicalType::try_from(&DataType::LargeBinary).unwrap()
+        );
+        assert_eq!(legacy_blob.children.len(), 0);
+        assert!(legacy_blob.metadata.contains_key(BLOB_META_KEY));
+
+        let blob_v2 = field.children.iter().find(|f| f.name == "blob_v2").unwrap();
+        assert_eq!(blob_v2.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert_eq!(blob_v2.children.len(), 5);
     }
 
     #[test]

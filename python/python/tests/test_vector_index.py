@@ -9,6 +9,7 @@ import shutil
 import string
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +23,10 @@ from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
-from lance.util import validate_vector_index  # noqa: E402
+from lance.util import (  # noqa: E402
+    _target_partition_size_to_num_partitions,
+    validate_vector_index,
+)
 from lance.vector import vec_to_table  # noqa: E402
 
 
@@ -178,6 +182,127 @@ def run(ds, q=None, assert_func=None):
 
 def test_flat(dataset):
     run(dataset)
+
+
+@pytest.mark.parametrize(
+    "queries",
+    [
+        np.random.randn(2, 128).astype(np.float32),
+        np.random.randn(1, 128).astype(np.float32),
+    ],
+    ids=["two_queries", "single_query"],
+)
+def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
+    k = 5
+    query_count = queries.shape[0]
+
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+            "use_index": False,
+        },
+    )
+
+    assert batch.num_rows == query_count * k
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    query_index_field = batch.schema.field("query_index")
+    assert query_index_field.type == pa.int32()
+    assert not query_index_field.nullable
+    expected_query_index = sum([[i] * k for i in range(query_count)], [])
+    assert batch["query_index"].to_pylist() == expected_query_index
+
+    _assert_batch_matches_single_queries(
+        dataset,
+        queries,
+        k=k,
+        nearest_kwargs={"use_index": False},
+    )
+
+
+def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
+    batch = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+            **nearest_kwargs,
+        },
+    )
+    if "distance_range" in nearest_kwargs:
+        lo, hi = nearest_kwargs["distance_range"]
+        assert all(lo <= d < hi for d in batch["_distance"].to_pylist())
+
+    for query_index, query in enumerate(queries):
+        single = ds.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": query,
+                "k": k,
+                **nearest_kwargs,
+            },
+        )
+        batch_slice = batch.filter(pc.field("query_index") == query_index)
+        assert batch_slice["id"].to_pylist() == single["id"].to_pylist()
+        np.testing.assert_allclose(
+            batch_slice["_distance"].to_numpy(),
+            single["_distance"].to_numpy(),
+        )
+
+
+def test_batch_vector_search_rejects_dataset_query_index_column(tmp_path):
+    dim = 128
+    table = create_table(nvec=80, ndim=dim)
+    table = table.append_column(
+        "query_index",
+        pa.array(range(80), type=pa.uint32()),
+    )
+    ds = lance.write_dataset(table, tmp_path / "with_query_index")
+
+    queries = np.random.randn(2, dim).astype(np.float32)
+    with pytest.raises(Exception, match="query_index"):
+        ds.to_table(
+            columns=["id", "query_index"],
+            nearest={
+                "column": "vector",
+                "q": queries,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
+def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
+    q = np.random.randn(256).astype(np.float32)
+    with pytest.raises(ValueError, match=r"256.*128"):
+        dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
+def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": 5,
+        },
+        fast_search=True,
+    )
+    assert batch.num_rows == 0
+    assert "query_index" in batch.column_names
 
 
 def test_ann(indexed_dataset):
@@ -451,6 +576,8 @@ def test_index_with_pq_codebook(tmp_path):
         ivf_centroids=np.random.randn(1, 128).astype(np.float32),
         pq_codebook=pq_codebook,
     )
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 8
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
@@ -465,6 +592,54 @@ def test_index_with_pq_codebook(tmp_path):
         replace=True,
     )
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+
+def test_index_with_4bit_numpy_pq_codebook(tmp_path):
+    tbl = create_table(nvec=1024, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 16, 128 // 4).astype(np.float32)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        num_bits=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+    )
+
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 4
+
+    result = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128).astype(np.float32),
+            "k": 10,
+        }
+    )
+    assert result.num_rows == 10
+
+
+def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
+    tbl = create_table(nvec=8, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+
+    with pytest.raises(
+        ValueError,
+        match=r"\(sub_vectors, 16, dim\) for num_bits=4, got \(4, 256, 32\)",
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=1,
+            num_sub_vectors=4,
+            num_bits=4,
+            ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+            pq_codebook=pq_codebook,
+        )
 
 
 @pytest.mark.cuda
@@ -734,6 +909,12 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
 
 
+def test_target_partition_size_to_num_partitions_clamps():
+    assert _target_partition_size_to_num_partitions(1000, 1000) == 1
+    assert _target_partition_size_to_num_partitions(1000, 500) == 2
+    assert _target_partition_size_to_num_partitions(8192 * 5000, 8192) == 4096
+
+
 def test_index_size_stats(tmp_path: Path):
     num_rows = 512
     dims = 32
@@ -934,6 +1115,59 @@ def test_create_ivf_rq_skip_transpose():
     )
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["packed"] is False
+
+
+def _assert_recall_at_least(ds, query, metric=None, k=10, recall_requirement=0.5):
+    nearest = {"column": "vector", "q": query, "k": k}
+    if metric is not None:
+        nearest["metric"] = metric
+
+    gt_ids = ds.to_table(nearest=nearest, columns=["id"])["id"].to_numpy()
+    create_index_kwargs = {
+        "index_type": "IVF_RQ",
+        "num_partitions": 4,
+        "num_bits": 9,
+    }
+    if metric is not None:
+        create_index_kwargs["metric"] = metric
+    indexed = ds.create_index("vector", **create_index_kwargs)
+    result_ids = indexed.to_table(nearest=nearest, columns=["id"])["id"].to_numpy()
+
+    assert result_ids.shape[0] == k
+    recall = len(set(gt_ids) & set(result_ids)) / k
+    assert recall >= recall_requirement, (
+        f"recall={recall}, gt={gt_ids}, result={result_ids}"
+    )
+    return indexed
+
+
+def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
+    rng = np.random.default_rng(42)
+    mat = rng.standard_normal((1000, 128)).astype(np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(range(len(mat))))
+
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = _assert_recall_at_least(ds, mat[0])
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = ds.to_table(
+            nearest={
+                "column": "vector",
+                "q": mat[0],
+                "k": 10,
+                "approx_mode": approx_mode,
+            },
+            columns=["id"],
+        )
+        assert result.num_rows == 10
+
+    cosine_ds = lance.write_dataset(tbl, "memory://")
+    cosine_ds = _assert_recall_at_least(cosine_ds, mat[1], metric="cosine")
+    cosine_stats = cosine_ds.stats.index_stats("vector_idx")
+    assert cosine_stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert cosine_stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
 
 
 def test_create_ivf_rq_requires_dim_divisible_by_8():
@@ -1588,6 +1822,8 @@ def test_index_cast_centroids(tmp_path):
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
     centroids = pa.FixedSizeListArray.from_arrays(values, 128)
 
+    # Cast invalidates the attached index; drop it first per the new contract.
+    dataset.drop_index(index_name)
     dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
 
     # centroids are f32, but the column is now f16
@@ -1663,7 +1899,7 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     assert results == results_no_scalar_index
 
 
-def test_load_indices(dataset):
+def test_describe_indices(dataset):
     indices = dataset.describe_indices()
     assert len(indices) == 0
 
@@ -1678,7 +1914,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     info = indexed_dataset.describe_indices()[0]
 
     assert info.name == "vector_idx"
-    assert info.type_url == "/lance.table.VectorIndexDetails"
+    assert info.type_url == "/lance.index.pb.VectorIndexDetails"
     assert info.index_type == "IVF_PQ"
     assert info.num_rows_indexed == 1000
     assert info.fields == [0]
@@ -1689,6 +1925,31 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     assert info.segments[0].index_version == 1
     assert info.segments[0].created_at is not None
 
+    details = info.details
+    assert details["metric_type"] == "L2"
+    assert details["compression"]["type"] == "pq"
+    assert details["compression"]["num_bits"] == 8
+    assert details["compression"]["num_sub_vectors"] == 16
+
+
+def test_describe_index_runtime_hints_stored(tmp_path):
+    tbl = create_table(nvec=300, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=4,
+        max_iters=100,
+        sample_rate=512,
+    )
+    details = dataset.describe_indices()[0].details
+    hints = details.get("runtime_hints", {})
+    assert hints.get("lance.ivf.max_iters") == "100"
+    assert hints.get("lance.ivf.sample_rate") == "512"
+    assert hints.get("lance.pq.max_iters") == "100"
+    assert hints.get("lance.pq.sample_rate") == "512"
+
 
 def test_optimize_indices(indexed_dataset):
     data = create_table()
@@ -1698,22 +1959,6 @@ def test_optimize_indices(indexed_dataset):
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     stats = indexed_dataset.stats.index_stats("vector_idx")
     assert stats["num_indices"] == 2
-
-
-def test_logical_and_physical_index_views(indexed_dataset):
-    data = create_table()
-    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
-    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
-
-    logical_indices = indexed_dataset.describe_indices()
-    assert len(logical_indices) == 1
-    assert logical_indices[0].name == "vector_idx"
-    assert len(logical_indices[0].segments) == 2
-    assert all(segment.fragment_ids for segment in logical_indices[0].segments)
-
-    stats = indexed_dataset.stats.index_stats("vector_idx")
-    assert stats["num_segments"] == stats["num_indices"] == 2
-    assert stats["segments"] == stats["indices"]
 
 
 @pytest.mark.skip(reason="retrain is deprecated")
@@ -1880,6 +2125,68 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
+def test_vector_index_with_query_parallelism(indexed_dataset):
+    q = np.random.randn(128)
+
+    sequential = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": 0,
+        }
+    )
+    parallel = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": -1,
+        }
+    )
+
+    assert sequential == parallel
+
+
+def test_vector_index_invalid_query_parallelism(indexed_dataset):
+    with pytest.raises(ValueError, match="query_parallelism"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "query_parallelism": -2,
+            }
+        )
+
+
+def test_vector_index_with_approx_mode(indexed_dataset):
+    q = np.random.randn(128)
+
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 10,
+                "approx_mode": approx_mode,
+            }
+        )
+        assert len(result) == 10
+
+
+def test_vector_index_invalid_approx_mode(indexed_dataset):
+    with pytest.raises(ValueError, match="approx_mode"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "approx_mode": "hacc",
+            }
+        )
+
+
 def test_knn_deleted_rows(tmp_path):
     data = create_table()
     ds = lance.write_dataset(data, tmp_path)
@@ -1963,7 +2270,7 @@ def test_nested_field_vector_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["embedding"]
+    assert indices[0].field_names == ["data.embedding"]
 
     # Test querying with the index
     query_vec = vectors[0]
@@ -2059,6 +2366,24 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_scanner_rejects_unknown_index_segments(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
+
+    with pytest.raises(
+        ValueError, match="with_index_segments referenced unknown index segments"
+    ):
+        dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128).astype(np.float32),
+                "k": 10,
+            },
+            index_segments=[uuid.uuid4()],
+        ).to_table()
 
 
 def test_vector_index_distance_range(tmp_path):
@@ -2761,16 +3086,96 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
             kwargs2["pq_codebook"] = pre["pq_codebook"]
     segment2 = ds.create_index_uncommitted(**kwargs2)
 
-    merged_segment = ds.merge_existing_index_segments([segment1, segment2])
-    ds = _commit_segments_helper(ds, [merged_segment], column="vector")
+    segments = [segment1, segment2]
+    ds = _commit_segments_helper(ds, segments, column="vector")
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 
 
-def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "merge_existing_segments_ds", 2000, 128)
+def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
+    ds = _make_sample_dataset_base(
+        tmp_path, "legacy_metadata_commit", n_rows=512, dim=32, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_FLAT",
+        "num_partitions": 2,
+        "ivf_centroids": ivf_model.centroids,
+    }
+    first = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[0].fragment_id],
+    )
+    second = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[1].fragment_id],
+    )
+
+    merged = ds.merge_existing_index_segments([first, second])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(32).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
+def test_distributed_ivf_rq_shared_rotation(tmp_path):
+    """Two IVF_RQ segments built on separate fragments with one shared RaBitQ rotation
+    merge into a single committed, queryable index. The shared ``rabitq_model`` (from
+    ``lance.lance.indices.build_rq_model``) is what makes the independently built
+    segments mergeable."""
+    from lance.lance import indices
+
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path, "dist_rq_merge", n_rows=512, dim=dim, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_RQ",
+        "num_partitions": 2,
+        "num_bits": 1,
+        "ivf_centroids": ivf_model.centroids,
+        "rabitq_model": rabitq_model,
+    }
+    first = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[0].fragment_id],
+    )
+    second = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[1].fragment_id],
+    )
+
+    merged = ds.merge_existing_index_segments([first, second])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(dim).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
+def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "segment_commit_ds", 2000, 128)
     frags = ds.get_fragments()
     assert len(frags) >= 2
     builder = IndicesBuilder(ds, "vector")
@@ -2796,14 +3201,9 @@ def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
         )
         for fragment in frags[:2]
     ]
-    assert all(segment.index_details is not None for segment in segments)
 
-    merged_segment = ds.merge_existing_index_segments(segments)
-    assert merged_segment.fragment_ids is not None
-    assert sorted(merged_segment.fragment_ids) == sorted(
-        [fragment.fragment_id for fragment in frags[:2]]
-    )
-    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged_segment])
+    assert len(segments) == 2
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})

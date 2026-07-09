@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::any::Any;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
 use arrow_array::types::UInt64Type;
@@ -17,8 +18,8 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -71,17 +72,29 @@ pub struct PQIndex {
 }
 
 impl DeepSizeOf for PQIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.pq.deep_size_of_children(context)
             + self
                 .code
                 .as_ref()
-                .map(|code| code.get_array_memory_size())
+                .map(|code| {
+                    if context.mark_seen(Arc::as_ptr(code) as *const () as usize) {
+                        (code.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
             + self
                 .row_ids
                 .as_ref()
-                .map(|row_ids| row_ids.get_array_memory_size())
+                .map(|row_ids| {
+                    if context.mark_seen(Arc::as_ptr(row_ids) as *const () as usize) {
+                        (row_ids.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
     }
 }
@@ -168,10 +181,6 @@ impl Index for PQIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }
@@ -235,7 +244,7 @@ impl VectorIndex for PQIndex {
         let pq = self.pq.clone();
         let query = query.clone();
         let num_sub_vectors = self.pq.code_dim() as i32;
-        spawn_cpu(move || {
+        let search = move || {
             let (code, row_ids) = if pre_filter.is_empty() {
                 Ok((code, row_ids))
             } else {
@@ -284,8 +293,8 @@ impl VectorIndex for PQIndex {
                     vec![dists, ids],
                 )?)
             }
-        })
-        .await
+        };
+        spawn_cpu(search).await
     }
 
     fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
@@ -430,14 +439,14 @@ impl VectorIndex for PQIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
             .enumerate()
             .filter_map(|(vec_idx, old_row_id)| {
-                let new_row_id = mapping.get(old_row_id).cloned();
+                let new_row_id = mapping.get(*old_row_id);
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
                 new_row_id.map(|new_row_id| {
@@ -636,7 +645,8 @@ pub(crate) fn build_pq_storage(
 mod tests {
     use super::*;
 
-    use std::ops::Range;
+    use std::collections::HashMap;
+    use std::{ops::Range, sync::Mutex};
 
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
@@ -645,8 +655,10 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowAddrMask;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_select::RowAddrMask;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
     };
@@ -812,11 +824,22 @@ mod tests {
 
     struct TestPreFilter {
         row_ids: Vec<u64>,
+        is_empty_threads: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl TestPreFilter {
         fn new(row_ids: Vec<u64>) -> Self {
-            Self { row_ids }
+            Self {
+                row_ids,
+                is_empty_threads: None,
+            }
+        }
+
+        fn with_thread_capture(row_ids: Vec<u64>, threads: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                row_ids,
+                is_empty_threads: Some(threads),
+            }
         }
     }
 
@@ -827,6 +850,14 @@ mod tests {
         }
 
         fn is_empty(&self) -> bool {
+            if let Some(threads) = &self.is_empty_threads {
+                threads.lock().unwrap().push(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
+            }
             self.row_ids.is_empty()
         }
 
@@ -851,5 +882,57 @@ mod tests {
         let (code, row_ids) = PQIndex::filter_arrays(&pre_filter, code, row_ids, 16).unwrap();
         assert!(code.values().is_empty());
         assert!(row_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pq_search_runs_on_cpu_thread_in_sequential_mode() {
+        let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
+        let index = PQIndex {
+            pq: ProductQuantizer::new(1, 8, 1, codebook, DistanceType::L2),
+            code: Some(Arc::new(UInt8Array::from(vec![0, 1, 0]))),
+            row_ids: Some(Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+            metric_type: MetricType::L2,
+            frag_reuse_index: None,
+        };
+        let query = Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0])) as ArrayRef,
+            k: 2,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let is_empty_threads = Arc::new(Mutex::new(Vec::new()));
+        let pre_filter = Arc::new(TestPreFilter::with_thread_capture(
+            vec![],
+            is_empty_threads.clone(),
+        ));
+
+        let batch = index
+            .search(&query, pre_filter, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let is_empty_threads = is_empty_threads.lock().unwrap();
+        assert!(
+            !is_empty_threads.is_empty(),
+            "expected PQ search closure to evaluate the prefilter"
+        );
+        assert!(
+            is_empty_threads
+                .iter()
+                .all(|name| name.contains("lance-cpu")),
+            "expected PQ search closure to run on a lance-cpu thread, got {is_empty_threads:?}"
+        );
     }
 }

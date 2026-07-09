@@ -43,7 +43,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             return Ok(path);
         }
 
-        Path::parse(url.path()).map_err(|e| {
+        Path::from_url_path(url.path()).map_err(|e| {
             Error::invalid_input(format!("Failed to parse path '{}': {}", url.path(), e))
         })
     }
@@ -123,6 +123,10 @@ mod tests {
             (
                 "file-object-store:///C:/Users/ADMINI~1/AppData/Local",
                 "C:/Users/ADMINI~1/AppData/Local",
+            ),
+            (
+                "file:///C:/Users/RUNNER~1/AppData/Local/Temp/tmpm49j_w0f",
+                "C:/Users/RUNNER~1/AppData/Local/Temp/tmpm49j_w0f",
             ),
         ];
 

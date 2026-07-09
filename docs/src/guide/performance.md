@@ -21,8 +21,13 @@ The Python/Java logger can be configured with several environment variables:
 
 ## Trace Events
 
-Lance uses tracing to log events. If you are running `pylance` then these events will be emitted to
+Lance uses tracing to log events. If you are running `pylance` then these events will be emitted
 as log messages. For Rust connections you can use the `tracing` crate to capture these events.
+
+Rust tracing targets are listed below. In `pylance` logs, trace events are emitted under a
+`lance::events::` prefix so they can be filtered separately from normal log records. For example,
+`LANCE_LOG="warn,lance::events::object_store::throttle=info"` shows storage throttling events
+without enabling other Lance event logs.
 
 ### File Audit
 
@@ -32,6 +37,31 @@ File audit events are emitted when significant files are created or deleted.
 | ------------------- | --------- | -------------------------------------------------------------------------- |
 | `lance::file_audit` | `mode`    | The mode of I/O operation (create, delete, delete_unverified)              |
 | `lance::file_audit` | `type`    | The type of file affected (manifest, data file, index file, deletion file) |
+
+### Dataset Events
+
+Dataset events are emitted when datasets are loaded, written, committed, deleted, compacted, or cleaned.
+
+| Event                   | Parameter   | Description                                                               |
+| ----------------------- | ----------- | ------------------------------------------------------------------------- |
+| `lance::dataset_events` | `event`     | The dataset event type (loading, writing, committed, deleting, and others) |
+| `lance::dataset_events` | `uri`       | The dataset URI                                                           |
+| `lance::dataset_events` | `mode`      | The write mode                                                            |
+| `lance::dataset_events` | `operation` | The committed transaction operation                                       |
+| `lance::dataset_events` | `predicate` | The delete predicate                                                      |
+| `lance::dataset_events` | `columns`   | The removed columns                                                       |
+
+### Object Store Throttle Events
+
+Object store throttle events are emitted when Lance observes cloud storage throttle responses and
+reduces or retries request rates.
+
+| Event                            | Parameter       | Description                              |
+| -------------------------------- | --------------- | ---------------------------------------- |
+| `lance::object_store::throttle`  | `previous_rate` | The request rate before AIMD adjustment  |
+| `lance::object_store::throttle`  | `new_rate`      | The request rate after AIMD adjustment   |
+| `lance::object_store::throttle`  | `attempt`       | The retry attempt for retry debug events |
+| `lance::object_store::throttle`  | `error`         | The underlying object store throttle error      |
 
 ### I/O Events
 
@@ -189,6 +219,37 @@ use cases. For example, S3 can typically get up to 5000
 req/s and with these settings we should get there in about
 10 seconds.
 
+## Fragment Sizing
+
+A Lance table is a collection of fragments tracked by a manifest. How you size those fragments
+trades off two classes of work:
+
+- **Manifest-level operations** scale with the *number* of fragments. Every dataset mutation
+  (appends, metadata updates, schema changes, compactions, etc.) rewrites the manifest, so a
+  larger fragment list makes every write slower. Reads pay a similar cost up front: opening a
+  dataset, listing fragments, planning a scan, and resolving transaction conflicts at the
+  dataset level all walk the manifest.
+- **Fragment-level operations** scale with the *size* of a fragment. These include scans
+  against a matching fragment, compaction, updates, deletes, and `merge_insert`. Conflict
+  detection for these operations is also done at the fragment level.
+
+Fewer, larger fragments make manifest-level operations cheap but make each fragment-level
+operation heavier and increase the chance of conflicts when many writers target the same
+fragment. More, smaller fragments do the reverse.
+
+Practical guidance:
+
+- The default of 1M rows per fragment works well up to ~1B rows. Past that, bumping toward
+  ~100M rows per fragment is reasonable, though fragment-count limits are rarely the bottleneck
+  in practice.
+- Tens of thousands of fragments per table is generally fine.
+- Keep individual fragments well under object-store object-size limits (S3 caps at 5 TB, and
+  stores tend to misbehave well before that). 10 GB–100 GB per fragment is a reasonable upper
+  range; 1 TB is a hard ceiling.
+- If you run many concurrent updates, deletes, or `merge_insert` operations, err toward more
+  fragments — conflict detection is per-fragment, so too few fragments leads to excess
+  retries.
+
 ## Conflict Handling
 
 Lance supports concurrent operations on the same table using optimistic concurrency control. When two
@@ -228,7 +289,7 @@ dataset.optimize.compact_files(defer_index_remap=True)
 ```
 
 For details on the index format and usage patterns, see the
-[Fragment Reuse Index specification](../format/table/index/system/frag_reuse.md).
+[Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 
 ## Indexes
 
@@ -384,11 +445,11 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are quantized to binary codes with a configurable number of bits per
-dimension. Each row also stores per-row scale and offset factors (4 bytes each) used for distance correction. Each
-row requires `dimension * num_bits / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For
-example, 100M rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
+scale and offset factors (4 bytes each) used for distance correction. Each row requires
+`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
+rows with 768 dimensions and 1 bit per dimension:
 
 ```
-100M * (768 * 1 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 16) = ~10.8 GiB
 ```

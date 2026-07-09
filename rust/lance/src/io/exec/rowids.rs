@@ -10,7 +10,7 @@ use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::Statistics;
@@ -29,8 +29,6 @@ use crate::Dataset;
 use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
-
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
@@ -47,7 +45,7 @@ pub struct AddRowAddrExec {
     /// Position in the output schema where to insert the row address
     rowaddr_pos: usize,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -106,10 +104,13 @@ impl AddRowAddrExec {
 
         // Is just a simple projections, so it inherits the partitioning and
         // execution mode from parent.
-        let properties = input
-            .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+        );
 
         Ok(Self {
             input,
@@ -188,15 +189,19 @@ impl AddRowAddrExec {
         let rowid_pos = self.rowid_pos;
         let rowaddr_pos = self.rowaddr_pos;
         let output_schema = self.output_schema.clone();
-        let stream = input_stream.then(move |batch| {
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input_stream.then(move |batch_result| {
             let output_schema = output_schema.clone();
             let index_prereq = index_prereq.clone();
+            let elapsed_compute = elapsed_compute.clone();
             async move {
-                let batch = batch?;
+                let batch = batch_result?;
                 index_prereq.wait_ready().await?;
                 let row_id_index = index_prereq.get_ready();
                 let index_ref = row_id_index.as_deref();
 
+                let _t = elapsed_compute.timer();
                 let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
@@ -208,14 +213,17 @@ impl AddRowAddrExec {
                 Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
             }
         });
-
-        let stream = InstrumentedRecordBatchStreamAdapter::new(
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
-            stream.boxed(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream))
+            stream,
+        )))
     }
 }
 
@@ -326,7 +334,7 @@ impl ExecutionPlan for AddRowAddrExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }
@@ -347,7 +355,7 @@ pub struct AddRowOffsetExec {
     input: Arc<dyn ExecutionPlan>,
     row_addr_pos: usize,
     frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AddRowOffsetExec {
@@ -376,7 +384,13 @@ impl AddRowOffsetExec {
 
         let new_eq_props =
             EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
-        let properties = input.properties().clone().with_eq_properties(new_eq_props);
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(new_eq_props),
+        );
 
         Ok(Self {
             input,
@@ -496,7 +510,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

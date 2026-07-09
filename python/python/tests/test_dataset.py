@@ -93,6 +93,25 @@ def test_roundtrip_types(tmp_path: Path):
     assert dataset.to_table() == table
 
 
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable", "2.1"])
+def test_write_zero_dimension_fixed_size_list(
+    tmp_path: Path, data_storage_version: str
+):
+    # Zero-dimension fixed-size lists must be rejected with a clean error
+    # instead of a divide-by-zero panic (#5102)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("vec", pa.list_(pa.float32(), 0)),
+        ]
+    )
+    table = pa.table({"id": [1], "vec": [[]]}, schema=schema)
+    with pytest.raises(OSError, match="dimension must be a positive integer"):
+        lance.write_dataset(
+            table, tmp_path / "ds.lance", data_storage_version=data_storage_version
+        )
+
+
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -424,18 +443,50 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
+@pytest.mark.parametrize("enable_stable_row_ids", [True, False])
+@pytest.mark.parametrize(
+    "rows",
+    [[{"a": 1}, {"a": 2}], []],
+    ids=["non_empty", "empty"],
+)
+def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool, rows):
+    schema = pa.schema([pa.field("a", pa.int64())])
+    table = pa.Table.from_pylist(rows, schema=schema)
+
+    path = tmp_path / f"stable_row_ids_{enable_stable_row_ids}_{len(rows)}"
+    lance.write_dataset(
+        table,
+        path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    ds = lance.dataset(path)
+
+    assert ds.count_rows() == len(rows)
+    assert len(ds.get_fragments()) == (0 if len(rows) == 0 else 1)
+    assert ds.has_stable_row_ids is enable_stable_row_ids
+
+
+def _list_manifests(versions_dir):
+    # Ignore the version hint file, which is not a manifest.
+    return [
+        name
+        for name in os.listdir(versions_dir)
+        if not name.startswith("latest_version_hint")
+    ]
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
 def test_default_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -445,12 +496,12 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert manifest_path == ["1.manifest"]
 
     # Migrate to v2 manifest paths
     lance.dataset(tmp_path).migrate_manifest_paths_v2()
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -471,7 +522,15 @@ def test_tag(tmp_path: Path):
         ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
+    ds.tags.replace_metadata("tag1", {"description": "first tag"})
+    tag1_meta = ds.tags.list()["tag1"]
+    assert tag1_meta["created_at"] is not None
+    assert isinstance(tag1_meta["created_at"], datetime)
+    assert tag1_meta["updated_at"] is not None
+    assert isinstance(tag1_meta["updated_at"], datetime)
+    assert tag1_meta["created_at"] == tag1_meta["updated_at"]
     assert len(ds.tags.list()) == 1
+    assert ds.tags.list()["tag1"]["metadata"] == {"description": "first tag"}
 
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 1)
@@ -505,13 +564,41 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
+    tag1_meta = ds.tags.list()["tag1"]
+    tag1_created_at = tag1_meta["created_at"]
+    tag1_updated_at = tag1_meta["updated_at"]
+    assert tag1_created_at is not None
+    assert tag1_updated_at is not None
+    ds.tags.replace_metadata("tag1", {"description": "updated tag"})
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+    replaced_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
+    assert replaced_tag1_meta["updated_at"] == tag1_updated_at
+
+    ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
+    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
+    assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
+
     ds.tags.update("tag1", 2)
+    updated_tag1_meta = ds.tags.list()["tag1"]
+    assert updated_tag1_meta["created_at"] == tag1_created_at
+    assert updated_tag1_meta["updated_at"] is not None
+    assert updated_tag1_meta["updated_at"] >= tag1_updated_at
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
+    assert ds.tags.list()["tag1"]["metadata"] == {"owner": "ml-team"}
+
+    ds.tags.replace_metadata("tag1", {})
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 2
+    assert ds.tags.list()["tag1"]["metadata"] == {}
 
     ds.tags.update("tag1", 1)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
+    assert ds.tags.list()["tag1"]["metadata"] == {}
 
     version = ds.tags.get_version("tag1")
     assert version == 1
@@ -558,6 +645,11 @@ def test_tag_order(tmp_path: Path):
 
     tags_asc = ds.tags.list_ordered(order="asc")
     assert len(tags_asc) == 3
+    first_tag = tags_asc[0][1]
+    assert first_tag["created_at"] is not None
+    assert isinstance(first_tag["created_at"], datetime)
+    assert first_tag["updated_at"] is not None
+    assert isinstance(first_tag["updated_at"], datetime)
     tag_names_asc = [t[0] for t in tags_asc]
     assert tag_names_asc == sorted(expected_tags.keys()), (
         f"Unexpected ascending order: {tag_names_asc}"
@@ -870,6 +962,49 @@ def test_take_with_projection(tmp_path: Path):
 
     table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
     assert table3 == table2
+
+
+def test_take_with_json_column(tmp_path: Path):
+    """Test that take/take_rows return JSON columns in Arrow JSON format (Utf8).
+
+    Previously, take would return lance.json (LargeBinary) instead of
+    arrow.json (Utf8), which is the user-facing format.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    base_dir = tmp_path / "test_take_json"
+    lance.write_dataset(data, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    # Dataset.take should return arrow.json type
+    result = dataset.take([2, 5, 8])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":2}'
+    assert metas[1] == '{"val":5}'
+    assert metas[2] == '{"val":8}'
+
+    # Dataset._take_rows should also return arrow.json type
+    result = dataset._take_rows([0, 3, 9])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":0}'
+    assert metas[1] == '{"val":3}'
+    assert metas[2] == '{"val":9}'
 
 
 def test_filter(tmp_path: Path):
@@ -1315,6 +1450,45 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
+def test_explain_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    before_versions = len(dataset.versions())
+
+    explanation = dataset.explain_cleanup_old_versions(
+        older_than=(datetime.now() - moment),
+        include_files=True,
+        max_files=1000,
+    )
+
+    assert explanation.read_version == dataset.version
+    assert explanation.stats.bytes_removed > 0
+    assert explanation.stats.old_versions == 1
+    assert explanation.candidate_files
+    assert not explanation.candidate_files_truncated
+    assert len(dataset.versions()) == before_versions
+
+    summary = dataset.explain_cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert summary.stats.old_versions == explanation.stats.old_versions
+    assert summary.candidate_files == []
+
+    with pytest.raises(ValueError, match="max_files must be positive"):
+        dataset.explain_cleanup_old_versions(
+            older_than=(datetime.now() - moment),
+            max_files=0,
+        )
+
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert stats.old_versions == explanation.stats.old_versions
+
+
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1593,6 +1767,51 @@ def test_strict_overwrite(tmp_path: Path):
         )
 
 
+def test_commit_timeout(tmp_path: Path):
+    from datetime import timedelta
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "timeout"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    # A zero duration reaches Rust and is rejected as invalid input.
+    with pytest.raises(OSError, match="non-zero"):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(0)
+        )
+
+    # A negative duration is rejected by PyO3's timedelta -> Duration conversion.
+    with pytest.raises(ValueError):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(seconds=-1)
+        )
+
+    # None disables the timeout.
+    dataset_no_timeout = lance.LanceDataset.commit(
+        dataset, append, read_version=1, commit_timeout=None
+    )
+    assert dataset_no_timeout.version == dataset.version + 1
+
+    # Explicit positive timeout works.
+    fragment2 = lance.fragment.LanceFragment.create(base_dir, table)
+    append2 = lance.LanceOperation.Append([fragment2])
+    dataset_with_timeout = lance.LanceDataset.commit(
+        dataset_no_timeout,
+        append2,
+        read_version=dataset_no_timeout.version,
+        commit_timeout=timedelta(minutes=1),
+    )
+    assert dataset_with_timeout.version == dataset_no_timeout.version + 1
+
+    # Timeout *firing* behavior is covered by the Rust test
+    # `test_commit_timeout_triggers`, which uses a throttled store for a
+    # reliable trigger; reproducing it from Python without exposing
+    # throttling would be flaky on fast runners.
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1635,6 +1854,7 @@ def test_commit_batch_append():
     result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
     dataset = result["dataset"]
     assert dataset.version == 2
+    assert dataset.checkout_version(1).version == 1
     assert len(dataset.get_fragments()) == 3
     assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
     merged_txn = result["merged"]
@@ -2216,7 +2436,6 @@ def test_merge_insert_subcols(tmp_path: Path):
     dataset = lance.write_dataset(
         initial_data, tmp_path / "dataset", max_rows_per_file=5
     )
-    original_fragments = dataset.get_fragments()
 
     new_values = pa.table(
         {
@@ -2226,6 +2445,12 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
     (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
 
+    # Partial-schema upserts run through the v2 `FullSchemaMergeInsertExec`
+    # path (see Rust issue #6442). We only assert the semantic outcome here
+    # — the exact fragment / file layout is an implementation detail of the
+    # v1 RewriteColumns optimization that no longer applies. Column `c`
+    # (not in the source) must retain its original values for the updated
+    # rows.
     expected = pa.table(
         {
             "a": range(10),
@@ -2234,20 +2459,6 @@ def test_merge_insert_subcols(tmp_path: Path):
         }
     )
     assert dataset.to_table().sort_by("a") == expected
-
-    # First fragment has new file
-    fragments = dataset.get_fragments()
-    assert fragments[0].fragment_id == original_fragments[0].fragment_id
-    assert fragments[1].fragment_id == original_fragments[1].fragment_id
-
-    assert len(fragments[0].data_files()) == 2
-    assert (
-        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
-    )
-    assert len(fragments[1].data_files()) == 1
-    assert str(fragments[1].data_files()[0]) == str(
-        original_fragments[1].data_files()[0]
-    )
 
     new_values = pa.table(
         {
@@ -2263,6 +2474,8 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
 
     assert dataset.count_rows() == 12
+    # Newly inserted rows (keys 10, 11) get NULL for column `c` because
+    # the source did not provide a value for it and `c` is nullable.
     expected = pa.table(
         {
             "a": range(0, 12),
@@ -2271,6 +2484,146 @@ def test_merge_insert_subcols(tmp_path: Path):
         }
     )
     assert dataset.to_table().sort_by("a") == expected
+
+
+def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
+    """End-to-end test: merge_insert with JSON columns where ALL rows are updated.
+
+    This exercises the "all rows updated" fast path in handle_fragment which
+    bypasses the Updater and writes directly. Without proper JSON conversion,
+    Utf8 data (i32 offsets) is written with a LargeBinary schema (i64 offsets),
+    causing a decoder panic on subsequent reads:
+        "the offset of the new Buffer cannot exceed the existing Length:
+         slice offset=0 Length=N selfLen=N/2"
+
+    Conditions to trigger the fast path:
+    1. Subschema update (not all columns provided)
+    2. ALL rows in a fragment are matched/updated
+    3. data_storage_version = 2.2
+    """
+    import json
+
+    json_type = pa.json_()
+
+    # Create dataset with v2.2 storage format
+    initial_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"original":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+            "score": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    dataset = lance.write_dataset(
+        initial_data,
+        tmp_path / "e2e_json_rewrite",
+        data_storage_version="2.2",
+    )
+    assert dataset.count_rows() == 5
+    assert len(dataset.get_fragments()) == 1
+
+    # Subschema merge_insert: only provide [unique_id, coarse], update ALL rows
+    # This triggers: subschema → v1 path → all rows matched → fast path
+    update_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"updated":true,"id":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset.merge_insert("unique_id").when_matched_update_all().execute(update_data)
+
+    # Critical: read back should NOT panic
+    result = dataset.to_table().sort_by("unique_id")
+    assert result.num_rows == 5
+
+    # Verify score column (not in update) is preserved
+    scores = result.column("score").to_pylist()
+    assert scores == [0, 1, 2, 3, 4]
+
+    # Verify JSON column was updated correctly
+    coarse_values = result.column("coarse").to_pylist()
+    for i, val in enumerate(coarse_values):
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True, (
+            f"Row {i} should have updated coarse, got {val}"
+        )
+
+    # Verify take also works (different read path)
+    take_result = dataset.take([0, 2, 4])
+    assert take_result.num_rows == 3
+    take_coarse = take_result.column("coarse").to_pylist()
+    for val in take_coarse:
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True
+
+    # Verify sample also works
+    sample_result = dataset.sample(3)
+    assert sample_result.num_rows == 3
+
+
+def test_merge_insert_subcols_with_json_column(tmp_path: Path):
+    """Test merge_insert with subschema update on a JSON extension type column.
+
+    Previously this would fail with:
+    'Incorrect datatype for StructArray field, expected Utf8 got LargeBinary'
+    because the update_fragments path didn't handle the Arrow JSON ↔ Lance JSON
+    type mismatch during interleave.
+    """
+    import json
+
+    json_type = pa.json_()
+    initial_data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+            "name": pa.array(["a", "b", "c", "d", "e"], type=pa.utf8()),
+            "score": pa.array([10, 20, 30, 40, 50], type=pa.int64()),
+            "meta": pa.array(
+                ['{"x":1}', '{"x":2}', '{"x":3}', '{"x":4}', '{"x":5}'],
+                type=json_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(initial_data, tmp_path / "merge_json_subcols")
+
+    # Subschema update: only provide id (key) + meta (JSON column to update)
+    new_values = pa.table(
+        {
+            "id": pa.array([2, 4], type=pa.int64()),
+            "meta": pa.array(
+                ['{"updated":true,"id":2}', '{"updated":true,"id":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    # This should NOT raise a type mismatch error
+    dataset.merge_insert("id").when_matched_update_all().execute(new_values)
+
+    # Verify results
+    result = dataset.to_table().sort_by("id")
+    ids = result.column("id").to_pylist()
+    scores = result.column("score").to_pylist()
+    metas = result.column("meta").to_pylist()
+
+    # Score column (not in update) should be preserved
+    assert scores == [10, 20, 30, 40, 50]
+
+    # Meta column should be updated for id=2 and id=4
+    for id_val, meta_val in zip(ids, metas):
+        parsed = json.loads(meta_val) if isinstance(meta_val, str) else meta_val
+        if id_val in (2, 4):
+            assert parsed.get("updated") is True, (
+                f"id={id_val} should have updated meta, got {meta_val}"
+            )
+        else:
+            assert "x" in str(parsed), (
+                f"id={id_val} should have original meta, got {meta_val}"
+            )
 
 
 def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
@@ -3033,6 +3386,106 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "name_1": pa.array(["1", "4", "7"]),
+                "name_2": pa.array(["2", "5", "8"]),
+                "name_3": pa.array(["3", "6", "9"]),
+            }
+        ),
+        tmp_path / "dataset",
+        enable_stable_row_ids=True,
+    )
+
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
+    check_update_stats(update_dict, (1,))
+
+    expected = pa.table(
+        {
+            "name_1": pa.array(["1", "4", "7"]),
+            "name_2": pa.array(["2", "5", "8"]),
+            "name_3": pa.array(["3", "6", "xxxx"]),
+        }
+    )
+    actual = dataset.to_table().sort_by("name_1")
+    assert actual == expected
+
+    scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
+    assert scanner_table == expected
+    assert scanner_table == actual
+
+
+def test_update_by_rowid(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_idx = 5
+    target_row_id = orig.column("_rowid")[target_idx].as_py()
+    target_id = orig.column("id")[target_idx].as_py()
+
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid = {target_row_id}",
+    )
+    check_update_stats(update_dict, (1,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] == target_id:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
+
+
+def test_update_by_rowid_in_list(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_indices = [3, 7, 15]
+    target_row_ids = [orig.column("_rowid")[i].as_py() for i in target_indices]
+    target_ids = {orig.column("id")[i].as_py() for i in target_indices}
+
+    in_list = ", ".join(str(rid) for rid in target_row_ids)
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid IN ({in_list})",
+    )
+    check_update_stats(update_dict, (3,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] in target_ids:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
 
 
 def test_update_dataset_all_types(tmp_path: Path):
@@ -4340,6 +4793,22 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
+def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    dataset.create_scalar_index("filter", "BTREE")
+    dataset = lance.write_dataset(
+        pa.table({"filter": range(100, 110)}), tmp_path, mode="append"
+    )
+
+    normal = dataset.to_table(filter="filter >= 95")
+    fast = dataset.to_table(filter="filter >= 95", fast_search=True)
+
+    assert normal.num_rows == 15
+    assert fast.num_rows == 5
+    assert sorted(fast.column("filter").to_pylist()) == list(range(95, 100))
+
+
 EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
 EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
 EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
@@ -5320,7 +5789,10 @@ def test_branches(tmp_path: Path):
     ds_main = lance.write_dataset(main_table, base_dir)
 
     branch1 = ds_main.create_branch("branch1")
+    ds_main.branches.replace_metadata("branch1", {"description": "branch one"})
     assert branch1.version == 1
+    # The dataset returned by create_branch must be fully constructed
+    assert branch1.checkout_version(("main", None)).version == 1
     branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
     branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
     assert branch1.version == 2
@@ -5338,10 +5810,13 @@ def test_branches(tmp_path: Path):
     branch1.tags.create("main_latest", (None, None))
     branch1.tags.create("main_latest2", ("main", None))
     branch1.create_branch("branch_from_main", ("main", None))
+    ordered_tags = dict(branch1.tags.list_ordered())
     branches_with_main = branch1.branches.list()
     assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
     assert branch1.tags.list()["main_latest"]["branch"] is None
     assert branch1.tags.list()["main_latest2"]["branch"] is None
+    assert ordered_tags["branch1_latest"]["branch"] == "branch1"
+    assert ordered_tags["main_latest"]["branch"] is None
     assert branches_with_main["branch_from_main"]["parent_branch"] is None
     assert branches_with_main["branch_from_main"]["branch_identifier"][0][0] == 1
     assert isinstance(
@@ -5377,6 +5852,10 @@ def test_branches(tmp_path: Path):
     assert isinstance(b1_meta["branch_identifier"][0][1], str)
     assert len(b1_meta["branch_identifier"][0][1]) > 0
     assert "create_at" in b1_meta
+    assert b1_meta["metadata"] == {"description": "branch one"}
+    ordered_branches = dict(ds_main.branches.list_ordered())
+    assert ordered_branches["branch1"]["metadata"] == {"description": "branch one"}
+    assert "metadata" in ordered_branches["branch2"]
 
     try:
         ds_main.checkout_version("branch_not_exists")
@@ -5433,4 +5912,33 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     distances = result["_distance"].to_pylist()
     assert distances == sorted(distances)
 
-    assert "id" in result.column_names
+
+def test_tracked_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+    ds.delete("x = 2")  # adds a deletion file
+
+    reader = ds.tracked_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("version").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+
+    types = set(result.column("type").to_pylist())
+    assert "manifest" in types
+    assert "data file" in types
+    assert "deletion file" in types
+
+
+def test_all_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+
+    reader = ds.all_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("size_bytes").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+    assert all(s > 0 for s in result.column("size_bytes").to_pylist())

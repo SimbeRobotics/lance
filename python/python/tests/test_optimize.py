@@ -9,6 +9,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
@@ -323,6 +324,80 @@ def test_defer_index_remap(tmp_path: Path):
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
+@pytest.mark.parametrize("use_commit_options", [True, False])
+def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
+    """Compaction.commit respects defer_index_remap passed in options.
+
+    When options={"defer_index_remap": True} is supplied to Compaction.commit
+    the __lance_frag_reuse system index must appear in describe_indices().
+    When the option is omitted (default) no such system index is written.
+    """
+    base_dir = tmp_path / f"dataset_commit_opts_{use_commit_options}"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+
+    plan = Compaction.plan(
+        dataset,
+        options=dict(target_rows_per_fragment=2_000, num_threads=1),
+    )
+    rewrites = [task.execute(dataset) for task in plan.tasks]
+
+    if use_commit_options:
+        Compaction.commit(dataset, rewrites, options={"defer_index_remap": True})
+    else:
+        Compaction.commit(dataset, rewrites)
+
+    dataset = lance.dataset(base_dir)
+    indices = dataset.describe_indices()
+    has_frag_reuse = any(idx.name == "__lance_frag_reuse" for idx in indices)
+
+    if use_commit_options:
+        assert has_frag_reuse, (
+            "expected __lance_frag_reuse system index when defer_index_remap=True "
+            "is passed to Compaction.commit"
+        )
+    else:
+        assert not has_frag_reuse, (
+            "did not expect __lance_frag_reuse system index when options is omitted "
+            "from Compaction.commit"
+        )
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
+    """describe_indices() and list_indices() must agree on the index_type
+    string for every index, including the __lance_frag_reuse system index
+    that defer_index_remap produces.
+
+    list_indices() is a wrapper over describe_indices(), so the two must stay
+    in sync. System indices are identified by name via infer_system_index_type()
+    in rust/lance/src/index.rs::IndexDescriptionImpl::try_new.
+    """
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset = lance.dataset(base_dir)
+    described = {d.name: d.index_type for d in dataset.describe_indices()}
+    listed = {idx["name"]: idx["type"] for idx in dataset.list_indices()}
+
+    assert "__lance_frag_reuse" in listed, (
+        "test precondition: defer_index_remap should produce a frag-reuse index"
+    )
+    assert described == listed, (
+        "describe_indices and list_indices disagree on index_type:\n"
+        f"  describe_indices: {described}\n"
+        f"  list_indices:     {listed}"
+    )
+
+
 def test_dataset_distributed_optimize(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     data = pa.table({"a": range(800), "b": range(800)})
@@ -412,6 +487,77 @@ def test_migration_via_fragment_apis(tmp_path):
     assert ds2.data_storage_version == "2.0"
 
 
+def test_optimize_indices_second_call_is_noop(tmp_path: Path):
+    """A second optimize_indices call when nothing has changed since the first
+    must not write any new files to the dataset directory."""
+    base_dir = tmp_path / "dataset"
+
+    n = 1024
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, 8)).astype(np.float32)
+    table = pa.table(
+        {
+            "id": pa.array(range(n), type=pa.int64()),
+            "category": pa.array([f"cat{i % 4}" for i in range(n)]),
+            "tags": pa.array([[f"t{i % 3}", f"t{(i + 1) % 3}"] for i in range(n)]),
+            "doc": pa.array([f"hello world document {i}" for i in range(n)]),
+            "name": pa.array([f"name_{i:05d}" for i in range(n)]),
+            "value": pa.array(range(n), type=pa.int64()),
+            "bloom_val": pa.array(range(n), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(vectors.reshape(-1), type=pa.float32()), 8
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    dataset.create_scalar_index("id", index_type="BTREE")
+    dataset.create_scalar_index("category", index_type="BITMAP")
+    dataset.create_scalar_index("tags", index_type="LABEL_LIST")
+    dataset.create_scalar_index("doc", index_type="INVERTED")
+    dataset.create_scalar_index("name", index_type="NGRAM")
+    dataset.create_scalar_index("value", index_type="ZONEMAP")
+    dataset.create_scalar_index("bloom_val", index_type="BLOOMFILTER")
+    # num_partitions=1 keeps this dataset balanced: the auto-rebalance check
+    # in merge_indices only finds join candidates when num_partitions > 1, and
+    # 1024 + 128 rows is well below the split threshold. Without this, the
+    # rebalance heuristic would keep finding work on the small partitions.
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=1, num_sub_vectors=2
+    )
+
+    extra_rows = 128
+    extra_vectors = rng.standard_normal((extra_rows, 8)).astype(np.float32)
+    extra = pa.table(
+        {
+            "id": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "category": pa.array([f"cat{i % 4}" for i in range(extra_rows)]),
+            "tags": pa.array([[f"t{i % 3}"] for i in range(extra_rows)]),
+            "doc": pa.array([f"goodbye world document {i}" for i in range(extra_rows)]),
+            "name": pa.array([f"add_{i:05d}" for i in range(extra_rows)]),
+            "value": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "bloom_val": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(extra_vectors.reshape(-1), type=pa.float32()), 8
+            ),
+        }
+    )
+    dataset = lance.write_dataset(extra, base_dir, mode="append")
+
+    # First optimize: should pull the new fragment into each index.
+    dataset.optimize.optimize_indices()
+
+    files_before = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+
+    # Second optimize: nothing has changed, so this must be a no-op on disk.
+    dataset.optimize.optimize_indices()
+
+    files_after = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+
+    new_files = files_after - files_before
+    assert not new_files, f"second optimize_indices created new files: {new_files}"
+
+
 def test_compaction_generates_rewrite_transaction(tmp_path: Path):
     # Create a small dataset with multiple fragments
     base_dir = tmp_path / "rewrite_txn"
@@ -428,3 +574,34 @@ def test_compaction_generates_rewrite_transaction(tmp_path: Path):
         t is not None and t.operation.__class__.__name__ == "Rewrite"
         for t in transactions
     )
+
+
+def test_remap_row_addrs(tmp_path: Path):
+    # Dataset.remap_row_addrs follows rows across a compaction via the
+    # fragment-reuse index: an address valid before the compaction maps to the
+    # row's new address after it. None when there is no fragment-reuse index.
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"id": range(1_000), "v": range(1_000)})
+    ds = lance.write_dataset(data, base_dir, max_rows_per_file=100)  # 10 fragments
+
+    # No fragment-reuse index yet -> None (nothing to remap against).
+    addrs = pa.array([0, 1 << 32, (5 << 32) | 7], pa.uint64())
+    assert ds.remap_row_addrs(addrs) is None
+
+    before = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
+
+    ds.optimize.compact_files(
+        target_rows_per_fragment=1_000, defer_index_remap=True, num_threads=1
+    )
+    ds = lance.dataset(base_dir)
+    assert any(idx.name == "__lance_frag_reuse" for idx in ds.describe_indices())
+
+    after = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    new = dict(zip(after["id"].to_pylist(), after["_rowaddr"].to_pylist()))
+
+    sample = [0, 137, 999]
+    remapped = ds.remap_row_addrs(
+        pa.array([old[i] for i in sample], pa.uint64())
+    ).to_pylist()
+    assert remapped == [new[i] for i in sample]

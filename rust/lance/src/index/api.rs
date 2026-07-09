@@ -7,8 +7,114 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
+use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::{Error, Result};
+
+/// A single physical segment of a logical index.
+///
+/// Each segment is stored independently and will become one manifest entry when committed.
+/// The logical index identity (name / target column / dataset version) is provided separately
+/// by the commit API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexSegment {
+    /// Unique ID of the physical segment.
+    uuid: Uuid,
+    /// The fragments covered by this segment.
+    fragment_bitmap: RoaringBitmap,
+    /// Metadata specific to the index type.
+    index_details: Arc<prost_types::Any>,
+    /// The on-disk index version for this segment.
+    index_version: i32,
+}
+
+impl IndexSegment {
+    /// Create a fully described segment with the given UUID, fragment coverage, and index
+    /// metadata.
+    pub fn new<I>(
+        uuid: Uuid,
+        fragment_bitmap: I,
+        index_details: Arc<prost_types::Any>,
+        index_version: i32,
+    ) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        Self {
+            uuid,
+            fragment_bitmap: fragment_bitmap.into_iter().collect(),
+            index_details,
+            index_version,
+        }
+    }
+
+    /// Return the UUID of this segment.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    /// Return the fragment coverage of this segment.
+    pub fn fragment_bitmap(&self) -> &RoaringBitmap {
+        &self.fragment_bitmap
+    }
+
+    /// Return the serialized index details for this segment.
+    pub fn index_details(&self) -> &Arc<prost_types::Any> {
+        &self.index_details
+    }
+
+    /// Return the on-disk index version for this segment.
+    pub fn index_version(&self) -> i32 {
+        self.index_version
+    }
+
+    /// Consume the segment and return its component parts.
+    pub fn into_parts(self) -> (Uuid, RoaringBitmap, Arc<prost_types::Any>, i32) {
+        (
+            self.uuid,
+            self.fragment_bitmap,
+            self.index_details,
+            self.index_version,
+        )
+    }
+}
+
+/// Convert an existing index segment representation into [`IndexSegment`].
+pub trait IntoIndexSegment {
+    /// Convert into an index segment.
+    fn into_index_segment(self) -> Result<IndexSegment>;
+}
+
+impl IntoIndexSegment for IndexSegment {
+    fn into_index_segment(self) -> Result<IndexSegment> {
+        Ok(self)
+    }
+}
+
+impl IntoIndexSegment for IndexMetadata {
+    fn into_index_segment(self) -> Result<IndexSegment> {
+        let fragment_bitmap = self.fragment_bitmap.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing fragment coverage",
+                self.uuid
+            ))
+        })?;
+        let index_details = self.index_details.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing index details",
+                self.uuid
+            ))
+        })?;
+
+        Ok(IndexSegment::new(
+            self.uuid,
+            fragment_bitmap.iter(),
+            index_details,
+            self.index_version,
+        ))
+    }
+}
 
 /// Extends [`crate::Dataset`] with secondary index APIs.
 #[async_trait]
@@ -61,6 +167,25 @@ pub trait DatasetIndexExt {
         ))
     }
 
+    /// Prewarm selected physical segments of an index by name.
+    async fn prewarm_index_segments(&self, _name: &str, _segment_ids: &[Uuid]) -> Result<()> {
+        Err(Error::not_supported(
+            "segment-level prewarm is not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Prewarm selected physical segments of an index by name with additional options.
+    async fn prewarm_index_segments_with_options(
+        &self,
+        _name: &str,
+        _segment_ids: &[Uuid],
+        _options: &PrewarmOptions,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "prewarm options are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
     /// Read all indices of this Dataset version.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
@@ -71,13 +196,10 @@ pub trait DatasetIndexExt {
     ///
     /// Note that it is possible to have multiple indices with the same UUID,
     /// as they are the deltas of the same index.
-    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices().await.map(|indices| {
-            indices
-                .iter()
-                .find(|idx| idx.uuid.to_string() == uuid)
-                .cloned()
-        })
+    async fn load_index(&self, uuid: &Uuid) -> Result<Option<IndexMetadata>> {
+        self.load_indices()
+            .await
+            .map(|indices| indices.iter().find(|idx| idx.uuid == *uuid).cloned())
     }
 
     /// Loads a specific index with the given index name.
@@ -130,11 +252,10 @@ pub trait DatasetIndexExt {
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
-    /// Merge one caller-defined group of existing uncommitted index segments into a
-    /// single segment.
+    /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
         &self,
-        segments: Vec<IndexMetadata>,
+        source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata>;
 
     /// Commit one or more existing physical index segments as a logical index.
@@ -142,7 +263,7 @@ pub trait DatasetIndexExt {
         &mut self,
         index_name: &str,
         column: &str,
-        segments: Vec<IndexMetadata>,
+        segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()>;
 
     async fn read_index_partition(

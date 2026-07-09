@@ -9,6 +9,20 @@ import "table_identifier.proto";
 import "table.proto";
 import "index.proto";
 
+// Query-time approximation mode for vector search.
+//
+// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+// Other index types ignore this setting.
+enum VectorApproxMode {
+  // Use all RQ bits for query-time scoring with u8-quantized lookup tables.
+  Normal = 0;
+  // Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+  Fast = 1;
+  // Use all RQ bits for query-time scoring with u16-quantized lookup tables
+  // to reduce estimator quantization error.
+  Accurate = 2;
+}
+
 // Serialized vector query parameters.
 message VectorQueryProto {
   // Query vector as Arrow IPC bytes (supports Float16, Float32, Float64, UInt8, etc.)
@@ -25,17 +39,34 @@ message VectorQueryProto {
   optional lance.index.pb.VectorMetricType metric_type = 10;
   bool use_index = 11;
   optional float dist_q_c = 12;
+  optional int32 query_parallelism = 13;
+  // Query-time approximation mode. Currently only affects RQ-quantized vector
+  // indexes, such as IVF_RQ. Other index types ignore this setting.
+  VectorApproxMode approx_mode = 14;
 }
 
 // Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.
 //
-// Note: ANNIvfSubIndexExec.prefilter_source (child ExecutionPlan) is NOT
-// serialized here. DataFusion's PhysicalExtensionCodec handles child plans
-// automatically via children() / with_new_children(). The codec receives
-// deserialized children in the `inputs` parameter of try_decode and
-// reconstructs the PreFilterSource from them.
+// The prefilter child ExecutionPlan is serialized by DataFusion's codec
+// automatically via children() / with_new_children(). The prefilter_type
+// field tells the decoder which PreFilterSource variant to use when
+// reconstructing from the deserialized child inputs.
 message ANNIvfSubIndexExecProto {
+  enum PreFilterType {
+    NONE = 0;
+    FILTERED_ROW_IDS = 1;
+    SCALAR_INDEX_QUERY = 2;
+  }
+
   VectorQueryProto query = 1;
   lance.datafusion.TableIdentifier table = 2;
   repeated lance.table.IndexMetadata indices = 3;
+  PreFilterType prefilter_type = 4;
+}
+
+// Serializable form of ANNIvfPartitionExec — the IVF centroid routing node.
+message ANNIvfPartitionExecProto {
+  VectorQueryProto query = 1;
+  lance.datafusion.TableIdentifier table = 2;
+  repeated string index_uuids = 3;
 }

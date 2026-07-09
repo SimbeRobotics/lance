@@ -284,8 +284,12 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
-        part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
-        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
+        part_files.push(tmp_part_dir.clone().join(format!("hnsw_part_{}", part_id)));
+        aux_part_files.push(
+            tmp_part_dir
+                .clone()
+                .join(format!("hnsw_part_aux_{}", part_id)),
+        );
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
@@ -505,7 +509,7 @@ async fn build_and_write_hnsw(
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
     writer.write_record_batch(batch).await?;
-    writer.finish_with_metadata(&metadata).await
+    Ok(writer.finish_with_metadata(&metadata).await?.num_rows as usize)
 }
 
 async fn build_and_write_pq_storage(
@@ -575,11 +579,7 @@ mod tests {
         assert_eq!(ds.get_fragments().len(), 2);
 
         let idx = ds
-            .open_vector_index(
-                "vector",
-                &indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let _ivf_idx = idx
